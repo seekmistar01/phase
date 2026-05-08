@@ -1850,9 +1850,9 @@ fn try_extract_intervening(
     ))
 }
 
-/// CR 702.49a: Parse "whenever you activate a ninjutsu ability" trigger.
-/// Matches all ninjutsu-family activation patterns.
-fn try_parse_ninjutsu_activation_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
+/// CR 702.49a + CR 702.142b: Parse "whenever you activate a [keyword] ability" triggers.
+/// Matches ninjutsu-family and boast activation patterns.
+fn try_parse_keyword_activation_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
     for prefix in ["whenever you activate ", "when you activate "] {
         let Ok((rest, ())) = value((), tag::<_, _, OracleError<'_>>(prefix)).parse(lower) else {
             continue;
@@ -1865,6 +1865,15 @@ fn try_parse_ninjutsu_activation_trigger(lower: &str) -> Option<(TriggerMode, Tr
             let mut def = make_base();
             def.mode = TriggerMode::NinjutsuActivated;
             return Some((TriggerMode::NinjutsuActivated, def));
+        }
+        // CR 702.142b: Match "a boast ability" — covers boast keyword activation
+        if tag::<_, _, OracleError<'_>>("a boast ability")
+            .parse(rest)
+            .is_ok()
+        {
+            let mut def = make_base();
+            def.mode = TriggerMode::BoastAbilityActivated;
+            return Some((TriggerMode::BoastAbilityActivated, def));
         }
     }
     None
@@ -4545,7 +4554,7 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
 
     // CR 702.49a: "whenever you activate a ninjutsu ability" — ninjutsu-family activation trigger.
     // Covers all ninjutsu variants (ninjutsu, commander ninjutsu, sneak).
-    if let Some(result) = try_parse_ninjutsu_activation_trigger(lower) {
+    if let Some(result) = try_parse_keyword_activation_trigger(lower) {
         return Some(result);
     }
 

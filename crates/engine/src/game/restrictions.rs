@@ -1,7 +1,7 @@
 use crate::game::game_object::GameObject;
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, ActivationRestriction, CastingRestriction, ParsedCondition,
-    QuantityExpr, SpellCastingOptionKind,
+    AbilityCost, AbilityDefinition, AbilityTag, ActivationRestriction, CastingRestriction,
+    ParsedCondition, QuantityExpr, SpellCastingOptionKind,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -10,6 +10,7 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
+use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
 use crate::types::SpellCastRecord;
 
@@ -346,6 +347,61 @@ pub fn record_ability_activation(
     *state.activated_abilities_this_game.entry(key).or_insert(0) += 1;
 }
 
+/// CR 702.142b: Compute the effective per-turn activation limit for an ability.
+/// Normally `OnlyOnceEachTurn` means limit = 1, but `ModifyActivationLimit` statics
+/// can override this for abilities matching a keyword tag (e.g., boast).
+fn effective_activation_limit(
+    state: &crate::types::game_state::GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+) -> u32 {
+    // Check if the ability at this index has a keyword tag
+    let ability_tag = state
+        .objects
+        .get(&source_id)
+        .and_then(|obj| obj.abilities.get(ability_index))
+        .and_then(|def| def.ability_tag);
+    let Some(tag) = ability_tag else {
+        return 1; // No tag → default once-per-turn
+    };
+    let keyword = match tag {
+        AbilityTag::Boast => "boast",
+    };
+    // Scan battlefield for ModifyActivationLimit statics that affect this keyword
+    let mut limit: u32 = 1;
+    for (bf_obj, static_def) in
+        crate::game::functioning_abilities::battlefield_active_statics(state)
+    {
+        if bf_obj.controller != player {
+            continue;
+        }
+        if let StaticMode::ModifyActivationLimit {
+            keyword: ref kw,
+            new_limit,
+        } = static_def.mode
+        {
+            if kw == keyword {
+                // Check if the source object is affected by this static
+                if static_def.affected.as_ref().is_some_and(|filter| {
+                    super::filter::matches_target_filter(
+                        state,
+                        source_id,
+                        filter,
+                        &super::filter::FilterContext::from_source_with_controller(
+                            bf_obj.id,
+                            bf_obj.controller,
+                        ),
+                    )
+                }) {
+                    limit = limit.max(u32::from(new_limit));
+                }
+            }
+        }
+    }
+    limit
+}
+
 fn activation_restriction_applies(
     state: &crate::types::game_state::GameState,
     player: PlayerId,
@@ -385,13 +441,15 @@ fn activation_restriction_applies(
         ActivationRestriction::BeforeAttackersDeclared => is_before_attackers_declared(state),
         ActivationRestriction::BeforeCombatDamage => is_before_combat_damage(state.phase),
         // CR 602.5b: Per-turn activation limit tracked via ability activation counter.
+        // CR 702.142b: ModifyActivationLimit statics may raise the limit for tagged abilities.
         ActivationRestriction::OnlyOnceEachTurn => {
-            state
+            let current_count = state
                 .activated_abilities_this_turn
                 .get(&key)
                 .copied()
-                .unwrap_or(0)
-                == 0
+                .unwrap_or(0);
+            let limit = effective_activation_limit(state, player, source_id, ability_index);
+            current_count < limit
         }
         // CR 602.5b: Per-game activation limit.
         ActivationRestriction::OnlyOnce => {

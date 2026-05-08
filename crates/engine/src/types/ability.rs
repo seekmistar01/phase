@@ -6119,6 +6119,16 @@ impl<'de> Deserialize<'de> for ModalSelectionCondition {
     }
 }
 
+/// CR 702.142b: Tag identifying the keyword origin of an ability.
+/// Used by effects that reference abilities by keyword class (e.g., "boast abilities",
+/// "ninjutsu abilities"). Survives serialization through the WASM boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AbilityTag {
+    /// CR 702.142a: This ability originated from a Boast keyword definition.
+    Boast,
+}
+
 /// Structured activation-time restrictions parsed from Oracle text.
 /// These describe when an activated ability may be activated; runtime
 /// enforcement can be added independently of parsing/export support.
@@ -6256,6 +6266,10 @@ pub struct AbilityDefinition {
     /// `None` = battlefield (default). `Some(Zone::Hand)` for Channel, Cycling, etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_zone: Option<Zone>,
+    /// CR 702.142b: Tag identifying the keyword origin of this ability.
+    /// Used by effects that reference abilities by keyword class (e.g., "boast abilities").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ability_tag: Option<AbilityTag>,
     /// Condition that must be met for this ability to execute during resolution.
     #[serde(default)]
     pub condition: Option<AbilityCondition>,
@@ -6353,6 +6367,7 @@ impl AbilityDefinition {
             sorcery_speed: false,
             activation_restrictions: Vec::new(),
             activation_zone: None,
+            ability_tag: None,
             condition: None,
             optional_targeting: false,
             optional: false,

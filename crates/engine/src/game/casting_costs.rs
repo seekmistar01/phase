@@ -723,6 +723,14 @@ fn push_ability_entry(
     // is a per-priority-window AI-guard — see `GameState::pending_activations`.
     state.pending_activations.push((source_id, ability_index));
     events.push(GameEvent::AbilityActivated { source_id });
+    // CR 702.142b: Emit additional event when a boast ability is activated.
+    super::casting_targets::emit_boast_event_if_tagged(
+        state,
+        source_id,
+        ability_index,
+        player,
+        events,
+    );
     state.priority_passes.clear();
     state.priority_pass_count = 0;
 

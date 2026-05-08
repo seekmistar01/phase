@@ -698,6 +698,7 @@ pub(super) fn apply_clause_continuation(
                 {
                     *existing_reveal |= reveal;
                 }
+                apply_search_destination_to_ability_chain(previous, destination, enter_tapped);
             }
             let mut change_zone = AbilityDefinition::new(
                 kind,
@@ -1003,6 +1004,27 @@ pub(super) fn apply_clause_continuation(
                 *rest_destination = destination;
             }
         }
+    }
+}
+
+fn apply_search_destination_to_ability_chain(
+    ability: &mut AbilityDefinition,
+    destination: Zone,
+    enter_tapped: bool,
+) {
+    let mut cursor = Some(ability);
+    while let Some(sub_ability) = cursor {
+        if let Effect::ChangeZone {
+            origin: Some(Zone::Library),
+            destination: existing_destination,
+            enter_tapped: existing_enter_tapped,
+            ..
+        } = &mut *sub_ability.effect
+        {
+            *existing_destination = destination;
+            *existing_enter_tapped = enter_tapped;
+        }
+        cursor = sub_ability.sub_ability.as_deref_mut();
     }
 }
 

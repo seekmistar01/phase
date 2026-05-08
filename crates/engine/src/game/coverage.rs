@@ -33,6 +33,7 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
     matches!(
         mode,
         StaticMode::ReduceAbilityCost { .. }
+            | StaticMode::ModifyActivationLimit { .. }
             | StaticMode::AdditionalLandDrop { .. }
             | StaticMode::ReduceCost { .. }
             | StaticMode::RaiseCost { .. }

@@ -383,6 +383,20 @@ pub enum StaticMode {
         /// "This effect can't reduce the mana in that cost to less than one mana."
         #[serde(default, skip_serializing_if = "Option::is_none")]
         minimum_mana: Option<u32>,
+        /// CR 601.2f: Dynamic multiplier for cost reduction (e.g., "for each Dragon you control").
+        /// When present, the total reduction is `amount * resolve_quantity(dynamic_count)`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dynamic_count: Option<QuantityRef>,
+    },
+    /// CR 702.142b: Modifies the per-turn activation limit for abilities matching
+    /// a keyword tag. E.g., "Creatures you control can boast twice during each of
+    /// your turns rather than once" → overrides `OnlyOnceEachTurn` to `MaxTimesEachTurn(2)`
+    /// for boast-tagged abilities on affected permanents.
+    ModifyActivationLimit {
+        /// The keyword tag whose activation limit is modified.
+        keyword: String,
+        /// The new per-turn activation count.
+        new_limit: u8,
     },
     /// CR 601.2f: Increases the cost of spells matching the filter.
     /// Permanent-based cost increase applied during casting (Thalia, etc.).
@@ -657,10 +671,15 @@ impl Hash for StaticMode {
                 keyword,
                 amount,
                 minimum_mana,
+                ..
             } => {
                 keyword.hash(state);
                 amount.hash(state);
                 minimum_mana.hash(state);
+            }
+            StaticMode::ModifyActivationLimit { keyword, new_limit } => {
+                keyword.hash(state);
+                new_limit.hash(state);
             }
             StaticMode::ExtraBlockers { count } => count.hash(state),
             StaticMode::RevealTopOfLibrary { all_players } => all_players.hash(state),
@@ -728,12 +747,16 @@ impl fmt::Display for StaticMode {
                 keyword,
                 amount,
                 minimum_mana,
+                ..
             } => {
                 if let Some(minimum_mana) = minimum_mana {
                     write!(f, "ReduceAbilityCost({keyword},{amount},{minimum_mana})")
                 } else {
                     write!(f, "ReduceAbilityCost({keyword},{amount})")
                 }
+            }
+            StaticMode::ModifyActivationLimit { keyword, new_limit } => {
+                write!(f, "ModifyActivationLimit({keyword},{new_limit})")
             }
             StaticMode::RaiseCost { .. } => write!(f, "RaiseCost"),
             StaticMode::CantGainLife => write!(f, "CantGainLife"),
@@ -889,6 +912,25 @@ impl FromStr for StaticMode {
                             keyword: kw.to_string(),
                             amount: amt.parse().unwrap_or(1),
                             minimum_mana: extra.and_then(|value| value.parse().ok()),
+                            dynamic_count: None,
+                        }
+                    } else {
+                        StaticMode::Other(s.to_string())
+                    }
+                } else {
+                    StaticMode::Other(s.to_string())
+                }
+            }
+            s if s.starts_with("ModifyActivationLimit(") => {
+                let inner = s
+                    .strip_prefix("ModifyActivationLimit(")
+                    .and_then(|s| s.strip_suffix(')'));
+                if let Some(inner) = inner {
+                    let mut parts = inner.split(',');
+                    if let (Some(kw), Some(limit)) = (parts.next(), parts.next()) {
+                        StaticMode::ModifyActivationLimit {
+                            keyword: kw.to_string(),
+                            new_limit: limit.parse().unwrap_or(2),
                         }
                     } else {
                         StaticMode::Other(s.to_string())

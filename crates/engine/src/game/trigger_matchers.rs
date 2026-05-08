@@ -108,6 +108,7 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         TriggerMode::Saddles => match_saddles,
         TriggerMode::SaddlesOrCrews => match_saddles_or_crews,
         TriggerMode::NinjutsuActivated => match_ninjutsu_activated,
+        TriggerMode::BoastAbilityActivated => match_boast_ability_activated,
         TriggerMode::Firebend => match_firebend,
         TriggerMode::Airbend => match_airbend,
         TriggerMode::Earthbend => match_earthbend,
@@ -417,6 +418,11 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
 
     // CR 702.49a: Ninjutsu activation trigger
     r.insert(TriggerMode::NinjutsuActivated, match_ninjutsu_activated);
+    // CR 702.142b: Boast ability activation trigger
+    r.insert(
+        TriggerMode::BoastAbilityActivated,
+        match_boast_ability_activated,
+    );
 
     // Avatar crossover: bending trigger matchers
     r.insert(TriggerMode::Firebend, match_firebend);
@@ -2109,6 +2115,27 @@ pub(super) fn match_ninjutsu_activated(
 ) -> bool {
     if let GameEvent::NinjutsuActivated { player_id, .. } = event {
         // Fire when the ninjutsu was activated by the trigger source's controller
+        state
+            .objects
+            .get(&source_id)
+            .map(|obj| obj.controller == *player_id)
+            .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+/// CR 702.142b: Matches when a player activates a boast ability.
+/// The trigger fires for the controller of the trigger source when they activate
+/// any ability tagged as Boast.
+pub(super) fn match_boast_ability_activated(
+    event: &GameEvent,
+    _trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+) -> bool {
+    if let GameEvent::BoastAbilityActivated { player_id, .. } = event {
+        // Fire when the boast ability was activated by the trigger source's controller
         state
             .objects
             .get(&source_id)

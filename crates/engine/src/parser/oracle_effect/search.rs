@@ -212,16 +212,16 @@ fn scan_distinct_names_clause(lower: &str) -> bool {
 /// so each filter phrase parses independently. Returns the primary filter and
 /// a list of extra filters; the list is empty in the common single-filter case.
 ///
-/// The conjunction scan ends at the first clause-terminating comma / period
-/// (e.g., `"..., put them onto the battlefield tapped, then shuffle"`) because
-/// anything after that belongs to the destination / action chain — not to the
-/// filter expression.
+/// The conjunction scan ends at the first action-clause comma or sentence
+/// boundary (e.g., `"..., put them onto the battlefield tapped, then shuffle"`)
+/// because anything after that belongs to the destination / action chain — not
+/// to the filter expression. Serial-list commas stay in the filter region.
 fn parse_search_filter_with_extras(
     tail: &str,
     ctx: &mut ParseContext,
 ) -> (TargetFilter, Vec<TargetFilter>) {
-    // structural: not dispatch — bound the filter region at the first clause
-    // terminator (comma / period) before running the conjunction combinator,
+    // structural: not dispatch — bound the filter region at the first action
+    // clause or sentence terminator before running the conjunction combinator,
     // so `" and "` inside e.g. `"put it onto the battlefield, then ..."` can't
     // pollute the filter split.
     let filter_region = search_filter_region(tail);
@@ -243,67 +243,116 @@ fn parse_search_filter_with_extras(
 }
 
 fn search_filter_region(text: &str) -> &str {
-    let filter_region_end = text
-        .find(',')
-        .or_else(|| text.find('.'))
-        .unwrap_or(text.len());
-    &text[..filter_region_end]
+    parse_filter_region_terminator(text).unwrap_or(text)
 }
 
-/// Split a filter-region string (no action chain) on `" and a "` / `" and an "`
-/// / `" and basic "` conjunctions using a nom `take_until` + `alt` scan. For
-/// the "and basic" variant the supertype stays attached to the following
-/// segment by re-prepending `"basic "` to the remainder after consuming the
-/// shared `" and "` prefix. Returns a single-segment vector when no
-/// conjunction matches.
+fn parse_filter_region_terminator(input: &str) -> Option<&str> {
+    [
+        ". ",
+        ".",
+        ", put ",
+        ", reveal ",
+        ", then ",
+        ", shuffle ",
+        ", exile ",
+    ]
+    .into_iter()
+    .filter_map(|delimiter| parse_filter_region_delimiter(input, delimiter))
+    .min_by_key(|before| before.len())
+}
+
+fn parse_filter_region_delimiter<'a>(input: &'a str, delimiter: &'static str) -> Option<&'a str> {
+    let mut scan = (
+        take_until::<_, _, OracleError<'_>>(delimiter),
+        tag(delimiter),
+    );
+    let Ok((_, (before, _))) = scan.parse(input) else {
+        return None;
+    };
+    Some(before)
+}
+
+// (nom `alt` arm that consumes the conjunction, amount pushed back onto
+// the remainder so the "basic" supertype stays on the following segment)
+#[derive(Clone, Copy)]
+enum Conjunction {
+    AndA,
+    AndAn,
+    AndBasic,
+    CommaA,
+    CommaAn,
+    CommaAndA,
+    CommaAndAn,
+    CommaBasic,
+    CommaAndBasic,
+}
+
+/// Split a filter-region string (no action chain) on article/basic
+/// conjunctions using a nom `take_until` scan. For basic variants the supertype
+/// stays attached to the following segment by re-prepending `"basic "` to the
+/// remainder after consuming the shared delimiter prefix. Returns a
+/// single-segment vector when no conjunction matches.
 fn split_filter_conjunctions(filter_region: &str) -> Vec<&str> {
-    use nom::branch::alt;
-    use nom::bytes::complete::take_until;
-    use nom::combinator::value;
-    use nom::Parser;
-
-    // (nom `alt` arm that consumes the conjunction, amount pushed back onto
-    // the remainder so the "basic" supertype stays on the following segment)
-    #[derive(Clone, Copy)]
-    enum Conjunction {
-        AndA,
-        AndAn,
-        AndBasic,
-    }
-
     let mut segments = Vec::new();
     let mut remaining = filter_region;
     loop {
-        // Scan ahead for the earliest conjunction tag. `take_until` + `alt` is
-        // the nom idiom for "find the first occurrence of any of these tags";
-        // the error branch falls through to a single-segment result.
-        let mut scan = (
-            take_until::<_, _, OracleError<'_>>(" and "),
-            alt((
-                value(Conjunction::AndA, tag(" and a ")),
-                value(Conjunction::AndAn, tag(" and an ")),
-                value(Conjunction::AndBasic, tag(" and basic ")),
-            )),
-        );
-
-        let Ok((rest, (before, conj))) = scan.parse(remaining) else {
+        let Some((rest, before, conj)) = parse_next_filter_conjunction(remaining) else {
             segments.push(remaining.trim());
             break;
         };
         segments.push(before.trim());
         remaining = match conj {
-            Conjunction::AndA | Conjunction::AndAn => rest,
+            Conjunction::AndA
+            | Conjunction::AndAn
+            | Conjunction::CommaA
+            | Conjunction::CommaAn
+            | Conjunction::CommaAndA
+            | Conjunction::CommaAndAn => rest,
             // Keep the "basic " supertype attached to the following segment.
-            // SAFETY: `rest` is a suffix of `filter_region`, so stepping back
+            // SAFETY: `rest` is a suffix of `remaining`, so stepping back
             // "basic ".len() bytes yields a well-aligned slice that begins with
             // "basic …".
-            Conjunction::AndBasic => {
-                let start = filter_region.len() - rest.len() - "basic ".len();
-                &filter_region[start..]
+            Conjunction::AndBasic | Conjunction::CommaBasic | Conjunction::CommaAndBasic => {
+                let start = remaining.len() - rest.len() - "basic ".len();
+                &remaining[start..]
             }
         };
     }
     segments
+}
+
+fn parse_next_filter_conjunction(input: &str) -> Option<(&str, &str, Conjunction)> {
+    [
+        (", and basic ", Conjunction::CommaAndBasic),
+        (", and an ", Conjunction::CommaAndAn),
+        (", and a ", Conjunction::CommaAndA),
+        (", basic ", Conjunction::CommaBasic),
+        (", an ", Conjunction::CommaAn),
+        (", a ", Conjunction::CommaA),
+        (" and basic ", Conjunction::AndBasic),
+        (" and an ", Conjunction::AndAn),
+        (" and a ", Conjunction::AndA),
+    ]
+    .into_iter()
+    .filter_map(|(delimiter, conjunction)| {
+        parse_filter_conjunction_delimiter(input, delimiter, conjunction)
+    })
+    .min_by_key(|(_, before, _)| before.len())
+}
+
+fn parse_filter_conjunction_delimiter<'a>(
+    input: &'a str,
+    delimiter: &'static str,
+    conjunction: Conjunction,
+) -> Option<(&'a str, &'a str, Conjunction)> {
+    let mut scan = (
+        take_until::<_, _, OracleError<'_>>(delimiter),
+        tag(delimiter),
+    );
+    let Ok((rest, (before, _))) = scan.parse(input) else {
+        return None;
+    };
+    Some((rest, before, conjunction))
 }
 
 /// Locate `tag_prefix` at a word boundary in `lower` and return the byte offset of
@@ -1594,7 +1643,7 @@ mod tests {
     use super::*;
     use crate::types::ability::{Comparator, QuantityRef, SharedQuality, SharedQualityRelation};
     use crate::types::keywords::Keyword;
-    use crate::types::mana::ManaCost;
+    use crate::types::mana::{ManaColor, ManaCost};
 
     #[test]
     fn search_target_opponent_library() {
@@ -2672,6 +2721,22 @@ mod tests {
         }
     }
 
+    /// CR 701.23a + CR 107.1: Lotuslight Dancers-style serial filters —
+    /// "a black card, a green card, and a blue card" — are three independent
+    /// search filters, not one black filter with swallowed comma text.
+    #[test]
+    fn search_serial_color_filters_extracts_all_colors() {
+        let details = parse_search_library_details(
+            "search your library for a black card, a green card, and a blue card. put those cards into your graveyard, then shuffle",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(details.extra_filters.len(), 2);
+        assert_filter_has_color(&details.filter, ManaColor::Black);
+        assert_filter_has_color(&details.extra_filters[0], ManaColor::Green);
+        assert_filter_has_color(&details.extra_filters[1], ManaColor::Blue);
+        assert_eq!(details.multi_destination, Zone::Graveyard);
+    }
+
     /// Regression: single-filter search ("a creature card") still lowers to
     /// `extra_filters = []` and does not spuriously match the dual-search path.
     #[test]
@@ -2681,6 +2746,18 @@ mod tests {
             &mut ParseContext::default(),
         );
         assert!(details.extra_filters.is_empty());
+    }
+
+    fn assert_filter_has_color(filter: &TargetFilter, expected: ManaColor) {
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert!(
+            tf.properties.iter().any(
+                |property| matches!(property, FilterProp::HasColor { color } if *color == expected)
+            ),
+            "expected {expected:?} color filter, got {tf:?}"
+        );
     }
 
     /// CR 608.2c + CR 701.23: Gifts Ungiven — "search your library for up to

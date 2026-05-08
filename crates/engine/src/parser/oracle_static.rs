@@ -30,10 +30,10 @@ use super::oracle_util::{
     SELF_REF_PARSE_ONLY_PHRASES, SELF_REF_TYPE_PHRASES,
 };
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, AttachmentKind, BasicLandType, CardPlayMode, ChosenSubtypeKind,
-    Comparator, ContinuousModification, ControllerRef, CountScope, FilterProp, ObjectScope,
-    QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypeFilter,
-    TypedFilter,
+    AbilityDefinition, AbilityKind, AbilityTag, ActivationRestriction, AttachmentKind,
+    BasicLandType, CardPlayMode, ChosenSubtypeKind, Comparator, ContinuousModification,
+    ControllerRef, CountScope, FilterProp, ObjectScope, ParsedCondition, QuantityExpr, QuantityRef,
+    StaticCondition, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{parse_counter_type, CounterMatch};
@@ -1641,13 +1641,41 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
     // NOTE: "enters with N counters" patterns are now handled by oracle_replacement.rs
     // as proper Moved replacement effects (paralleling the "enters tapped" pattern).
 
+    // --- CR 702.142b: "[Filter] can boast N times ... rather than once" ---
+    // Birgi, God of Storytelling: modifies per-turn activation limit for boast abilities.
+    if let Some((new_limit, _)) = nom_on_lower(tp.original, tp.lower, |i| {
+        let (i, _) = take_until("can boast ").parse(i)?;
+        let (i, _) = tag("can boast ").parse(i)?;
+        // "twice" / "thrice" are multiplicative adverbs; "[N] times" is cardinal.
+        let (i, n) = alt((
+            value(2u32, tag("twice")),
+            value(3u32, tag("thrice")),
+            terminated(nom_primitives::parse_number, tag(" times")),
+        ))
+        .parse(i)?;
+        let (i, _) = take_until("rather than once").parse(i)?;
+        let (i, _) = tag("rather than once").parse(i)?;
+        Ok((i, n as u8))
+    }) {
+        // Parse the affected filter from the beginning of the text (before "can boast")
+        let (affected, _) = parse_type_phrase(tp.original);
+        return Some(
+            StaticDefinition::new(StaticMode::ModifyActivationLimit {
+                keyword: "boast".to_string(),
+                new_limit,
+            })
+            .affected(affected)
+            .description(text.to_string()),
+        );
+    }
+
     // --- "{Ability} abilities you activate cost {N} less to activate" ---
     // CR 601.2f: Ability-type-specific cost reduction (e.g., Silver-Fur Master, Fluctuator).
     if nom_primitives::scan_contains(tp.lower, "abilities you activate")
         && nom_primitives::scan_contains(tp.lower, "less to activate")
     {
         // Extract keyword name and amount via nom combinators
-        if let Some(((keyword, amount), _)) = nom_on_lower(tp.original, tp.lower, |i| {
+        if let Some(((keyword, amount), remainder)) = nom_on_lower(tp.original, tp.lower, |i| {
             let (i, kw) = terminated(
                 nom::bytes::complete::take_until(" abilities you activate"),
                 tag(" abilities you activate"),
@@ -1663,11 +1691,26 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
         })
         .filter(|((keyword, _), _)| !keyword.trim().is_empty())
         {
+            // CR 601.2f: Extract optional "for each [X]" dynamic count clause from remainder.
+            let remainder_lower = remainder.to_lowercase();
+            let dynamic_count: Option<QuantityRef> = tag::<_, _, OracleError<'_>>(" for each ")
+                .parse(remainder_lower.as_str())
+                .ok()
+                .and_then(|(for_each_rest, _)| {
+                    super::oracle_quantity::parse_for_each_clause_expr(for_each_rest)
+                })
+                .map(|expr| match expr {
+                    QuantityExpr::Ref { qty } => qty,
+                    _ => QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter::card()),
+                    },
+                });
             return Some(
                 StaticDefinition::new(StaticMode::ReduceAbilityCost {
                     keyword: keyword.trim().to_string(),
                     amount,
                     minimum_mana: parse_activated_cost_reduction_minimum_mana(tp.lower),
+                    dynamic_count,
                 })
                 .affected(TargetFilter::Typed(
                     TypedFilter::card().controller(ControllerRef::You),
@@ -1698,6 +1741,7 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
                         keyword: "activated".to_string(),
                         amount,
                         minimum_mana: parse_activated_cost_reduction_minimum_mana(tp.lower),
+                        dynamic_count: None,
                     })
                     .affected(affected)
                     .description(text.to_string()),
@@ -6540,6 +6584,36 @@ fn parse_quoted_rule_static_modifications(text: &str) -> Option<Vec<ContinuousMo
 fn parse_quoted_ability(text: &str) -> AbilityDefinition {
     let lower = text.to_lowercase();
 
+    // CR 702.142a: Detect "Boast — " prefix and strip it, adding the implicit
+    // Boast activation restrictions + tag. This handles cards that grant Boast
+    // abilities via quoted text (e.g., Besieged Viking Village).
+    if let Some(((), rest_original)) = nom_on_lower(text, &lower, |i| {
+        value(
+            (),
+            alt((
+                tag("boast \u{2014} "),
+                tag("boast -- "),
+                tag("boast—"),
+                tag("boast-"),
+            )),
+        )
+        .parse(i)
+    }) {
+        let mut def = parse_quoted_ability(rest_original);
+        // CR 702.142a: "Activate only if this creature attacked this turn
+        // and only once each turn."
+        def.activation_restrictions
+            .push(ActivationRestriction::OnlyOnceEachTurn);
+        def.activation_restrictions
+            .push(ActivationRestriction::RequiresCondition {
+                condition: Some(ParsedCondition::SourceAttackedThisTurn),
+            });
+        // CR 702.142b: Tag as Boast for meta-reference effects.
+        def.ability_tag = Some(AbilityTag::Boast);
+        def.description = Some(format!("Boast \u{2014} {}", rest_original));
+        return def;
+    }
+
     // CR 603.1: Detect trigger prefixes and route to trigger parser.
     // Quoted ability text starting with "When"/"Whenever"/"At the beginning of" is a
     // triggered ability, not a spell-like effect chain. Extract the trigger's execute
@@ -11302,6 +11376,7 @@ mod tests {
                     ref keyword,
                     amount: 1,
                     minimum_mana: None,
+                    dynamic_count: None,
                 } if keyword == "ninjutsu"
             ),
             "Expected ReduceAbilityCost {{ keyword: ninjutsu, amount: 1 }}, got {:?}",
@@ -11321,6 +11396,7 @@ mod tests {
                 keyword: "equip".to_string(),
                 amount: 1,
                 minimum_mana: None,
+                dynamic_count: None,
             }
         );
     }
@@ -14132,6 +14208,7 @@ mod tests {
                 keyword: "activated".to_string(),
                 amount: 2,
                 minimum_mana: None,
+                dynamic_count: None,
             }
         );
     }
@@ -14148,6 +14225,7 @@ mod tests {
                 keyword: "activated".to_string(),
                 amount: 2,
                 minimum_mana: Some(1),
+                dynamic_count: None,
             }
         );
     }

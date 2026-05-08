@@ -98,6 +98,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
         GameEvent::SpellCast { .. }
         | GameEvent::AbilityActivated { .. }
         | GameEvent::NinjutsuActivated { .. }
+        | GameEvent::BoastAbilityActivated { .. }
         | GameEvent::StackPushed { .. }
         | GameEvent::StackResolved { .. }
         | GameEvent::SpellCountered { .. } => LogCategory::Stack,
@@ -244,6 +245,15 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
         } => vec![
             player_seg(state, *player_id),
             text(" activates ninjutsu: "),
+            card_seg(state, *source_id),
+        ],
+
+        GameEvent::BoastAbilityActivated {
+            player_id,
+            source_id,
+        } => vec![
+            player_seg(state, *player_id),
+            text(" activates boast: "),
             card_seg(state, *source_id),
         ],
 

@@ -192,6 +192,10 @@ fn handle_activated_mode_choice(
     }
 
     events.push(GameEvent::AbilityActivated { source_id });
+    // CR 702.142b: Emit additional event when a boast ability is activated.
+    if let Some(index) = ability_index {
+        super::casting_targets::emit_boast_event_if_tagged(state, source_id, index, player, events);
+    }
     state.priority_passes.clear();
     state.priority_pass_count = 0;
     Ok(WaitingFor::Priority { player })

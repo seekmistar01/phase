@@ -430,6 +430,14 @@ pub enum GameEvent {
         source_id: ObjectId,
     },
 
+    /// CR 702.142b: A boast ability was activated. Emitted alongside AbilityActivated
+    /// when the activated ability has `ability_tag == Some(AbilityTag::Boast)`.
+    /// Enables "whenever you activate a boast ability" triggers.
+    BoastAbilityActivated {
+        player_id: PlayerId,
+        source_id: ObjectId,
+    },
+
     /// CR 702.110: A creature exploited another creature (sacrificed via exploit ETB).
     CreatureExploited {
         exploiter: ObjectId,

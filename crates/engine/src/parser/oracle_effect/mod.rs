@@ -18602,6 +18602,70 @@ mod tests {
     }
 
     #[test]
+    fn lotuslight_dancers_serial_search_moves_each_card_to_graveyard() {
+        let def = parse_effect_chain(
+            "Search your library for a black card, a green card, and a blue card. Put those cards into your graveyard, then shuffle.",
+            AbilityKind::Spell,
+        );
+
+        assert_search_color(&def, ManaColor::Black);
+        let first_move = def.sub_ability.as_deref().expect("expected first move");
+        assert_library_change_destination(first_move, Zone::Graveyard);
+
+        let second_search = first_move
+            .sub_ability
+            .as_deref()
+            .expect("expected second search");
+        assert_search_color(second_search, ManaColor::Green);
+        let second_move = second_search
+            .sub_ability
+            .as_deref()
+            .expect("expected second move");
+        assert_library_change_destination(second_move, Zone::Graveyard);
+
+        let third_search = second_move
+            .sub_ability
+            .as_deref()
+            .expect("expected third search");
+        assert_search_color(third_search, ManaColor::Blue);
+        let third_move = third_search
+            .sub_ability
+            .as_deref()
+            .expect("expected third move");
+        assert_library_change_destination(third_move, Zone::Graveyard);
+    }
+
+    fn assert_search_color(def: &AbilityDefinition, expected: ManaColor) {
+        let Effect::SearchLibrary { filter, .. } = &*def.effect else {
+            panic!("expected SearchLibrary, got {:?}", def.effect);
+        };
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected typed search filter, got {filter:?}");
+        };
+        assert!(
+            typed.properties.iter().any(
+                |property| matches!(property, FilterProp::HasColor { color } if *color == expected)
+            ),
+            "expected {expected:?} search filter, got {typed:?}"
+        );
+    }
+
+    fn assert_library_change_destination(def: &AbilityDefinition, expected: Zone) {
+        assert!(
+            matches!(
+                *def.effect,
+                Effect::ChangeZone {
+                    origin: Some(Zone::Library),
+                    destination,
+                    ..
+                } if destination == expected
+            ),
+            "expected Library -> {expected:?} ChangeZone, got {:?}",
+            def.effect
+        );
+    }
+
+    #[test]
     fn search_library_details_up_to_five() {
         let details = parse_search_library_details(
             "search your library for up to five creature cards",

@@ -1,4 +1,4 @@
-use crate::types::ability::{Effect, ModalChoice, QuantityExpr, TargetRef};
+use crate::types::ability::{AbilityTag, Effect, ModalChoice, QuantityExpr, TargetRef};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, PendingCast, StackEntry, StackEntryKind, WaitingFor};
 use crate::types::identifiers::ObjectId;
@@ -209,6 +209,8 @@ pub(crate) fn handle_select_targets(
         events.push(GameEvent::AbilityActivated {
             source_id: pending.object_id,
         });
+        // CR 702.142b: Emit additional event when a boast ability is activated.
+        emit_boast_event_if_tagged(state, pending.object_id, ability_index, player, events);
         state.priority_passes.clear();
         state.priority_pass_count = 0;
         return Ok(WaitingFor::Priority { player });
@@ -297,6 +299,8 @@ pub(crate) fn handle_choose_target(
                 events.push(GameEvent::AbilityActivated {
                     source_id: pending.object_id,
                 });
+                // CR 702.142b: Emit additional event when a boast ability is activated.
+                emit_boast_event_if_tagged(state, pending.object_id, ability_index, player, events);
                 state.priority_passes.clear();
                 state.priority_pass_count = 0;
                 return Ok(WaitingFor::Priority { player });
@@ -355,6 +359,28 @@ fn extract_fixed_distribution_total(effect: &Effect) -> Option<u32> {
             ..
         } => Some(*value as u32),
         _ => None,
+    }
+}
+
+/// CR 702.142b: If the activated ability at `ability_index` on the source object
+/// has `ability_tag == Some(AbilityTag::Boast)`, emit a `BoastAbilityActivated` event.
+pub(crate) fn emit_boast_event_if_tagged(
+    state: &GameState,
+    source_id: ObjectId,
+    ability_index: usize,
+    player: PlayerId,
+    events: &mut Vec<GameEvent>,
+) {
+    let is_boast = state
+        .objects
+        .get(&source_id)
+        .and_then(|obj| obj.abilities.get(ability_index))
+        .is_some_and(|def| def.ability_tag == Some(AbilityTag::Boast));
+    if is_boast {
+        events.push(GameEvent::BoastAbilityActivated {
+            player_id: player,
+            source_id,
+        });
     }
 }
 

@@ -6,8 +6,8 @@ use nom::Parser;
 use serde::{Deserialize, Serialize};
 
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
-    AdditionalCost, CastingRestriction, Comparator, ContinuousModification,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
+    ActivationRestriction, AdditionalCost, CastingRestriction, Comparator, ContinuousModification,
     DelayedTriggerCondition, Effect, ManaProduction, ModalChoice, ParsedCondition, QuantityExpr,
     ReplacementDefinition, SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition,
     TargetFilter, TriggerCondition, TriggerDefinition, TypedFilter,
@@ -1445,6 +1445,9 @@ pub(crate) fn parse_oracle_ir(
                     .push(ActivationRestriction::RequiresCondition {
                         condition: Some(ParsedCondition::SourceAttackedThisTurn),
                     });
+                // CR 702.142b: Tag this ability as originating from Boast so
+                // effects can reference "boast abilities" as a class.
+                def.ability_tag = Some(AbilityTag::Boast);
                 extract_cost_reduction_from_chain(&mut def);
                 result.abilities.push(def);
                 i += 1;

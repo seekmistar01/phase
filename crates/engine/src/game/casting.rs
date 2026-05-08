@@ -5121,6 +5121,14 @@ pub fn handle_activate_ability(
             // is a per-priority-window AI-guard — see `GameState::pending_activations`.
             state.pending_activations.push((source_id, ability_index));
             events.push(GameEvent::AbilityActivated { source_id });
+            // CR 702.142b: Emit additional event when a boast ability is activated.
+            super::casting_targets::emit_boast_event_if_tagged(
+                state,
+                source_id,
+                ability_index,
+                player,
+                events,
+            );
             state.priority_passes.clear();
             state.priority_pass_count = 0;
             return Ok(WaitingFor::Priority { player });
@@ -5180,6 +5188,14 @@ pub fn handle_activate_ability(
     // is a per-priority-window AI-guard — see `GameState::pending_activations`.
     state.pending_activations.push((source_id, ability_index));
     events.push(GameEvent::AbilityActivated { source_id });
+    // CR 702.142b: Emit additional event when a boast ability is activated.
+    super::casting_targets::emit_boast_event_if_tagged(
+        state,
+        source_id,
+        ability_index,
+        player,
+        events,
+    );
 
     state.priority_passes.clear();
     state.priority_pass_count = 0;
@@ -5321,6 +5337,7 @@ fn apply_static_activated_ability_cost_reduction(
             keyword,
             amount,
             minimum_mana,
+            ..
         } = &def.mode
         else {
             continue;
@@ -7331,6 +7348,7 @@ mod tests {
                     keyword: "activated".to_string(),
                     amount: 1,
                     minimum_mana: None,
+                    dynamic_count: None,
                 })
                 .affected(TargetFilter::Typed(TypedFilter {
                     type_filters: vec![TypeFilter::Subtype("Food".to_string())],
@@ -7483,6 +7501,7 @@ mod tests {
                     keyword: "activated".to_string(),
                     amount: 2,
                     minimum_mana: Some(1),
+                    dynamic_count: None,
                 })
                 .affected(TargetFilter::Typed(
                     TypedFilter::creature().controller(ControllerRef::You),
