@@ -2,18 +2,18 @@
 set -euo pipefail
 
 DATA_DIR="data/scryfall"
-ARTWORK_FILE="$DATA_DIR/unique-artwork.json"
+CARDS_FILE="$DATA_DIR/default-cards.json"
 OUTPUT="client/public/scryfall-printings.json"
 
 echo "=== Scryfall Printings Generation ==="
 
-if [ ! -f "$ARTWORK_FILE" ]; then
-  echo "Downloading Scryfall unique-artwork bulk data..."
+if [ ! -f "$CARDS_FILE" ]; then
+  echo "Downloading Scryfall default-cards bulk data..."
   mkdir -p "$DATA_DIR"
   DOWNLOAD_URI=$(curl -s "https://api.scryfall.com/bulk-data" \
-    | jq -r '.data[] | select(.type == "unique_artwork") | .download_uri')
-  curl -L -o "$ARTWORK_FILE" "$DOWNLOAD_URI"
-  echo "Downloaded $ARTWORK_FILE."
+    | jq -r '.data[] | select(.type == "default_cards") | .download_uri')
+  curl -L -o "$CARDS_FILE" "$DOWNLOAD_URI"
+  echo "Downloaded $CARDS_FILE."
 fi
 
 if [ -f "$OUTPUT" ]; then
@@ -69,7 +69,7 @@ jq -c --argjson exclude "$NON_PLAYABLE" '
     value: ([.[].entry] | sort_by(.released_at) | reverse)
   }) |
   from_entries
-' "$ARTWORK_FILE" > "$OUTPUT"
+' "$CARDS_FILE" > "$OUTPUT"
 
 ENTRY_COUNT=$(jq 'length' "$OUTPUT")
 FILE_SIZE=$(du -h "$OUTPUT" | cut -f1)
