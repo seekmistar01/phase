@@ -1889,17 +1889,35 @@ fn resolve_counters_on_scope(
     counter_type: Option<&str>,
 ) -> i32 {
     match scope {
-        ObjectScope::Source => state
-            .objects
-            .get(&ctx.source)
-            .map(|obj| counter_count_from_map(&obj.counters, counter_type))
-            .or_else(|| {
-                state
-                    .lki_cache
-                    .get(&ctx.source)
-                    .map(|lki| counter_count_from_map(&lki.counters, counter_type))
-            })
-            .unwrap_or(0),
+        // CR 122.2 + CR 400.7 + CR 603.10a: When the source has changed zones
+        // (e.g., a dies-trigger reading "counters on ~"), `obj.counters` has
+        // been cleared by `apply_zone_exit_cleanup`. The LKI snapshot captured
+        // there preserves the pre-exit counter map per CR 400.7's "new object"
+        // semantics.
+        //
+        // The fallback must be zone-keyed, not presence-keyed: an object that
+        // died and was returned earlier this turn keeps both a stale LKI entry
+        // (from the death) and a live counter map (post-return). A live
+        // battlefield object's `obj.counters` is authoritative; only when the
+        // source has changed zones (so it isn't on the battlefield as the
+        // "same" object) does CR 603.10a's look-back apply.
+        //
+        // Mirrors `resolve_object_pt`'s LKI fallback for power/toughness
+        // (where the cleared field becomes `None`); the counter analogue must
+        // be zone-keyed because an empty `HashMap<CounterType, u32>` is
+        // `Some({})`, not `None`.
+        ObjectScope::Source => {
+            let live = state.objects.get(&ctx.source);
+            let on_battlefield =
+                live.is_some_and(|obj| obj.zone == crate::types::zones::Zone::Battlefield);
+            if !on_battlefield {
+                if let Some(lki) = state.lki_cache.get(&ctx.source) {
+                    return counter_count_from_map(&lki.counters, counter_type);
+                }
+            }
+            live.map(|obj| counter_count_from_map(&obj.counters, counter_type))
+                .unwrap_or(0)
+        }
         ObjectScope::CostPaidObject => ability
             .and_then(|ability| ability.cost_paid_object.as_ref())
             .map(|snapshot| counter_count_from_map(&snapshot.lki.counters, counter_type))
