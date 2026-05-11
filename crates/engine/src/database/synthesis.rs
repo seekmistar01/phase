@@ -1493,6 +1493,120 @@ pub fn synthesize_persist(face: &mut CardFace) {
     synthesize_dies_return_with_counter(face, &Keyword::Persist, "M1M1", "-1/-1", "702.79a");
 }
 
+/// CR 702.86a: Annihilator N — "Whenever this creature attacks, defending
+/// player sacrifices N permanents."
+///
+/// Each `Keyword::Annihilator(n)` on the face emits one attack-triggered
+/// ability whose execute body is `Effect::Sacrifice` over the permanent pool
+/// controlled by the per-attacker defending player. The defending player is
+/// resolved at resolution time through
+/// `ControllerRef::DefendingPlayer` →
+/// `defending_player_for_attacker(state, ability.source_id)` (CR 508.5 / 508.5a:
+/// the defending player relative to an attacking creature is the specific
+/// player that creature is attacking — never "each opponent"). This means in
+/// multiplayer, only the player being attacked by THIS creature sacrifices.
+///
+/// CR 702.86b: "If a creature has multiple instances of annihilator, each
+/// triggers separately." One trigger is synthesized per `Keyword::Annihilator`
+/// on the face. (CR 113.2c also independently mandates that multiple instances
+/// of an ability function independently.)
+///
+/// The trigger uses `TriggerMode::Attacks` with `valid_card = SelfRef` so it
+/// fires only when this creature is among the declared attackers
+/// (`match_attacks` in `trigger_matchers.rs`).
+///
+/// Sacrifice count is encoded as `QuantityExpr::Fixed { value: n }`. The
+/// shared sacrifice resolver (`game::effects::sacrifice::resolve`) routes
+/// `ControllerRef::DefendingPlayer` through `resolve_sacrifice_scope` and
+/// handles the "fewer permanents than N" case via the CR 701.16b mandatory-all
+/// fast-path — no separate "as many as possible" plumbing is needed here.
+pub fn synthesize_annihilator(face: &mut CardFace) {
+    let annihilator_values: Vec<u32> = face
+        .keywords
+        .iter()
+        .filter_map(|kw| match kw {
+            Keyword::Annihilator(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if annihilator_values.is_empty() {
+        return;
+    }
+
+    // Count keyword instances so re-running the synthesizer on an already
+    // built face is a no-op while still respecting CR 702.86b: distinct
+    // instances each emit their own trigger.
+    let existing_matching: usize = face
+        .triggers
+        .iter()
+        .filter(|t| is_annihilator_attack_trigger(t))
+        .count();
+    if existing_matching >= annihilator_values.len() {
+        return;
+    }
+
+    let remaining = annihilator_values.len() - existing_matching;
+    for &n in annihilator_values
+        .iter()
+        .skip(existing_matching)
+        .take(remaining)
+    {
+        // CR 701.16a + CR 701.21a: sacrifice scope derives from the target
+        // filter's `ControllerRef`. `DefendingPlayer` routes to
+        // `defending_player_for_attacker(state, source_id)` at resolution.
+        let sacrifice_effect = Effect::Sacrifice {
+            target: TargetFilter::Typed(
+                TypedFilter::permanent().controller(ControllerRef::DefendingPlayer),
+            ),
+            count: QuantityExpr::Fixed { value: n as i32 },
+            min_count: 0,
+        };
+
+        let execute =
+            AbilityDefinition::new(AbilityKind::Spell, sacrifice_effect).description(format!(
+                "Defending player sacrifices {n} permanent{}",
+                if n == 1 { "" } else { "s" }
+            ));
+
+        let trigger = TriggerDefinition::new(TriggerMode::Attacks)
+            .valid_card(TargetFilter::SelfRef)
+            .execute(execute)
+            .description(format!(
+                "CR 702.86a: Annihilator {n} — whenever ~ attacks, defending player sacrifices {n} permanent{}.",
+                if n == 1 { "" } else { "s" }
+            ));
+
+        face.triggers.push(trigger);
+    }
+}
+
+/// Idempotency-shape predicate for `synthesize_annihilator`. True iff `trigger`
+/// is the synthesized Annihilator attack-trigger shape (`TriggerMode::Attacks`
+/// with `valid_card = SelfRef` and execute body `Effect::Sacrifice` over a
+/// `ControllerRef::DefendingPlayer` permanent filter).
+///
+/// The check is narrow on purpose: an unrelated `Attacks` trigger on the same
+/// face (e.g., "Whenever ~ attacks, you draw a card") must NOT be counted as
+/// an existing Annihilator emission.
+fn is_annihilator_attack_trigger(t: &TriggerDefinition) -> bool {
+    if !matches!(t.mode, TriggerMode::Attacks)
+        || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return false;
+    }
+    let Some(execute) = t.execute.as_deref() else {
+        return false;
+    };
+    let Effect::Sacrifice { target, .. } = &*execute.effect else {
+        return false;
+    };
+    matches!(
+        target,
+        TargetFilter::Typed(tf)
+            if tf.controller == Some(ControllerRef::DefendingPlayer)
+    )
+}
+
 /// Shared synthesizer for the Undying/Persist class (CR 702.93a / CR 702.79a):
 /// "When this permanent dies, if it had no `<polarity>` counters on it, return
 /// it to the battlefield under its owner's control with a `<polarity>` counter
@@ -1934,6 +2048,11 @@ pub fn synthesize_all(face: &mut CardFace) {
     // -1/-1 counter, gated on having had no -1/-1 counter at death (LKI).
     // Sibling of Undying via shared `synthesize_dies_return_with_counter`.
     synthesize_persist(face);
+    // CR 702.86a: Annihilator N — attacks trigger that forces the defending
+    // player to sacrifice N permanents. CR 702.86b: each instance triggers
+    // separately. Defending player resolved per-attacker via
+    // `ControllerRef::DefendingPlayer` (CR 508.5 / 508.5a).
+    synthesize_annihilator(face);
     // CR 702.62a: Suspend — hand-activated alt-cost + upkeep counter-removal +
     // last-counter free-cast. Runs after Evoke to keep alt-cost synthesizers
     // grouped; idempotent so order against Cycling/Madness is irrelevant.
@@ -3831,6 +3950,479 @@ mod undying_persist_runtime_tests {
             PlayerId(0),
             "persist must return under its owner's control, not under the death-time controller"
         );
+    }
+}
+
+#[cfg(test)]
+mod annihilator_synthesis_tests {
+    //! CR 702.86a + CR 702.86b shape tests: the synthesized Annihilator
+    //! trigger is an `Attacks` trigger gated on `SelfRef` whose execute body
+    //! is `Effect::Sacrifice` over a permanent filter scoped to the defending
+    //! player via `ControllerRef::DefendingPlayer`.
+    use super::*;
+
+    fn annihilator_face(n: u32) -> CardFace {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Annihilator(n));
+        face
+    }
+
+    /// CR 702.86a: synthesizer emits an `Attacks` trigger with execute body
+    /// `Effect::Sacrifice` over `DefendingPlayer`-controlled permanents.
+    #[test]
+    fn synthesize_annihilator_adds_attack_trigger() {
+        let mut face = annihilator_face(2);
+        synthesize_annihilator(&mut face);
+
+        let trigger = face
+            .triggers
+            .iter()
+            .find(|t| matches!(t.mode, TriggerMode::Attacks))
+            .expect("annihilator should add an Attacks trigger");
+
+        assert!(
+            matches!(trigger.valid_card, Some(TargetFilter::SelfRef)),
+            "valid_card must be SelfRef so the trigger fires only when this \
+             creature attacks (not when other attackers are declared)"
+        );
+
+        let Some(execute) = trigger.execute.as_deref() else {
+            panic!("execute body required");
+        };
+        let Effect::Sacrifice {
+            target,
+            count,
+            min_count,
+        } = &*execute.effect
+        else {
+            panic!("execute body must be Effect::Sacrifice");
+        };
+        assert_eq!(*min_count, 0);
+        assert!(matches!(count, QuantityExpr::Fixed { value: 2 }));
+
+        let TargetFilter::Typed(tf) = target else {
+            panic!("sacrifice target must be a TypedFilter");
+        };
+        assert_eq!(
+            tf.controller,
+            Some(ControllerRef::DefendingPlayer),
+            "sacrifice scope must be the defending player (CR 508.5)"
+        );
+        // CR 701.21a: Annihilator sacrifices permanents, not just creatures.
+        assert!(
+            tf.type_filters
+                .iter()
+                .any(|f| matches!(f, TypeFilter::Permanent)),
+            "filter must target permanents"
+        );
+    }
+
+    /// Repeated synthesis must not duplicate the trigger (idempotency).
+    #[test]
+    fn synthesize_annihilator_is_idempotent() {
+        let mut face = annihilator_face(1);
+        synthesize_annihilator(&mut face);
+        synthesize_annihilator(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_annihilator_attack_trigger(t))
+            .count();
+        assert_eq!(count, 1, "annihilator trigger should be deduped");
+    }
+
+    /// Cards without Annihilator are unaffected.
+    #[test]
+    fn synthesize_annihilator_is_noop_without_keyword() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Flying);
+        synthesize_annihilator(&mut face);
+        assert!(face.triggers.is_empty());
+    }
+
+    /// Negative test: a creature with unrelated keywords must not synthesize
+    /// an Annihilator trigger.
+    #[test]
+    fn synthesize_annihilator_does_not_affect_other_keywords() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Trample);
+        face.keywords.push(Keyword::Vigilance);
+        synthesize_annihilator(&mut face);
+        assert!(face.triggers.is_empty());
+    }
+
+    /// CR 702.86b: "If a creature has multiple instances of annihilator, each
+    /// triggers separately." A card with two `Keyword::Annihilator` entries
+    /// (e.g., a hypothetical card with two printed instances, or one printed
+    /// plus one granted) synthesizes two distinct triggers. CR 113.2c also
+    /// independently requires this.
+    #[test]
+    fn synthesize_annihilator_emits_one_trigger_per_instance() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Annihilator(1));
+        face.keywords.push(Keyword::Annihilator(3));
+        synthesize_annihilator(&mut face);
+        let triggers: Vec<_> = face
+            .triggers
+            .iter()
+            .filter(|t| is_annihilator_attack_trigger(t))
+            .collect();
+        assert_eq!(triggers.len(), 2);
+
+        // Both N=1 and N=3 must be present from the first pass.
+        let ns: Vec<i32> = triggers
+            .iter()
+            .filter_map(|t| match t.execute.as_deref().map(|a| &*a.effect) {
+                Some(Effect::Sacrifice {
+                    count: QuantityExpr::Fixed { value },
+                    ..
+                }) => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert!(ns.contains(&1) && ns.contains(&3));
+    }
+
+    /// Idempotency-shape predicate must NOT match unrelated `Attacks` triggers
+    /// (e.g., "Whenever this creature attacks, draw a card"). A face with both
+    /// a card-draw Attacks trigger and `Keyword::Annihilator(1)` must produce
+    /// the Annihilator trigger without the predicate misclassifying the
+    /// draw-trigger as Annihilator.
+    #[test]
+    fn synthesize_annihilator_distinguishes_unrelated_attacks_triggers() {
+        let mut face = annihilator_face(1);
+        // Install an unrelated Attacks trigger on the face FIRST.
+        let unrelated = TriggerDefinition::new(TriggerMode::Attacks)
+            .valid_card(TargetFilter::SelfRef)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+        face.triggers.push(unrelated);
+        synthesize_annihilator(&mut face);
+
+        let annihilator_count = face
+            .triggers
+            .iter()
+            .filter(|t| is_annihilator_attack_trigger(t))
+            .count();
+        assert_eq!(
+            annihilator_count, 1,
+            "the unrelated draw-on-attack trigger must not pre-satisfy the \
+             Annihilator idempotency check"
+        );
+        // Total triggers: 1 draw + 1 Annihilator.
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| matches!(t.mode, TriggerMode::Attacks))
+                .count(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod annihilator_runtime_tests {
+    //! CR 702.86a runtime integration: an attacking creature with
+    //! `Keyword::Annihilator(N)` declared as an attacker fires the synthesized
+    //! Attacks trigger via `process_triggers(&[AttackersDeclared { … }])`. The
+    //! triggered ability lands on the stack; `resolve_top` invokes the
+    //! Sacrifice resolver, which routes `ControllerRef::DefendingPlayer`
+    //! through `defending_player_for_attacker(state, source_id)` (reading
+    //! `state.combat.attackers`) to identify the player who must sacrifice.
+
+    use super::*;
+    use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
+    use crate::game::printed_cards::apply_card_face_to_object;
+    use crate::game::triggers::process_triggers;
+    use crate::game::zones::create_object;
+    use crate::types::actions::GameAction;
+    use crate::types::card_type::CoreType;
+    use crate::types::events::GameEvent;
+    use crate::types::game_state::{GameState, StackEntryKind, WaitingFor};
+    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::player::PlayerId;
+
+    /// Build an Annihilator-bearing creature face and run the full synthesis
+    /// pipeline so the Attacks trigger is installed.
+    fn annihilator_creature_face(name: &str, n: u32) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            power: Some(PtValue::Fixed(15)),
+            toughness: Some(PtValue::Fixed(15)),
+            keywords: vec![Keyword::Annihilator(n)],
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        synthesize_all(&mut face);
+        face
+    }
+
+    /// Place a generic permanent (no special abilities) on the battlefield
+    /// for `controller`. Used to populate the defending player's sacrifice
+    /// pool.
+    fn place_dummy_permanent(state: &mut GameState, controller: PlayerId, name: &str) -> ObjectId {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(
+            state,
+            card_id,
+            controller,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        // CR 701.21a: a permanent (Annihilator sacrifices "permanents", which
+        // includes any non-emblem battlefield object). Mark as a creature so
+        // it cleanly satisfies the TypeFilter::Permanent check without
+        // overloading the test fixture.
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        id
+    }
+
+    /// Build an `AttackersDeclared` event for `attacker_id` attacking
+    /// `defending_player`. Mirrors the event shape produced by
+    /// `declare_attackers` so `match_attacks` recognizes it as a real attack
+    /// declaration.
+    fn attackers_declared_event(attacker_id: ObjectId, defending_player: PlayerId) -> GameEvent {
+        GameEvent::AttackersDeclared {
+            attacker_ids: vec![attacker_id],
+            defending_player,
+            attacks: vec![(attacker_id, AttackTarget::Player(defending_player))],
+        }
+    }
+
+    /// Spawn an Annihilator creature attacking `defending_player`, populate
+    /// `state.combat.attackers` so `defending_player_for_attacker` can find
+    /// the per-attacker defending player, then fire the AttackersDeclared
+    /// event and resolve the synthesized trigger off the stack.
+    fn attack_and_resolve_to_sacrifice(
+        state: &mut GameState,
+        face: &CardFace,
+        controller: PlayerId,
+        defending_player: PlayerId,
+    ) -> ObjectId {
+        let next_card = CardId(state.next_object_id);
+        let attacker_id = create_object(
+            state,
+            next_card,
+            controller,
+            face.name.clone(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&attacker_id).unwrap();
+            apply_card_face_to_object(obj, face);
+        }
+
+        // CR 508.5: `defending_player_for_attacker` reads from
+        // `state.combat.attackers`. Populate the attacker entry so the
+        // sacrifice resolver can identify the defending player by source id.
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::new(
+                attacker_id,
+                AttackTarget::Player(defending_player),
+                defending_player,
+            )],
+            ..Default::default()
+        });
+
+        process_triggers(
+            state,
+            &[attackers_declared_event(attacker_id, defending_player)],
+        );
+
+        assert!(
+            state
+                .stack
+                .iter()
+                .any(|entry| matches!(&entry.kind, StackEntryKind::TriggeredAbility { .. })),
+            "Annihilator Attacks trigger must land on the stack"
+        );
+
+        let mut resolve_events = Vec::new();
+        crate::game::stack::resolve_top(state, &mut resolve_events);
+        attacker_id
+    }
+
+    /// CR 702.86a + CR 508.5 happy path: an attacker with Annihilator 2
+    /// attacks P1; P1 has 3 sacrifice-eligible permanents and must choose 2
+    /// of them to sacrifice. The synthesized trigger should park the engine
+    /// in `WaitingFor::EffectZoneChoice` with P1 as the chooser and
+    /// `count = 2`.
+    #[test]
+    fn annihilator_attacks_defending_player_sacrifices_n_permanents() {
+        let face = annihilator_creature_face("Emrakul's Echo", 2);
+
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = crate::types::phase::Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let p1_a = place_dummy_permanent(&mut state, PlayerId(1), "Pawn A");
+        let p1_b = place_dummy_permanent(&mut state, PlayerId(1), "Pawn B");
+        let p1_c = place_dummy_permanent(&mut state, PlayerId(1), "Pawn C");
+        // Ability controller has a permanent too; it must NOT enter the
+        // defending player's sacrifice pool.
+        let p0_own = place_dummy_permanent(&mut state, PlayerId(0), "Own Pawn");
+
+        let _attacker =
+            attack_and_resolve_to_sacrifice(&mut state, &face, PlayerId(0), PlayerId(1));
+
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                count,
+                effect_kind,
+                ..
+            } => {
+                assert_eq!(*player, PlayerId(1), "defending player chooses sacrifices");
+                assert_eq!(*count, 2, "Annihilator 2 sacrifices exactly 2");
+                assert_eq!(*effect_kind, crate::types::ability::EffectKind::Sacrifice);
+                assert!(cards.contains(&p1_a));
+                assert!(cards.contains(&p1_b));
+                assert!(cards.contains(&p1_c));
+                assert!(
+                    !cards.contains(&p0_own),
+                    "attacker's controller's permanent must NOT be in the \
+                     defending player's sacrifice pool"
+                );
+                assert_eq!(cards.len(), 3);
+            }
+            other => panic!("expected EffectZoneChoice on defending player, got {other:?}"),
+        }
+
+        // Drive the choice: defending player sacrifices two specific
+        // permanents.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![p1_a, p1_b],
+            },
+        )
+        .unwrap();
+
+        // CR 701.21a: sacrificed permanents end up in their owner's graveyard.
+        assert_eq!(
+            state.objects.get(&p1_a).unwrap().zone,
+            Zone::Graveyard,
+            "Pawn A sacrificed"
+        );
+        assert_eq!(
+            state.objects.get(&p1_b).unwrap().zone,
+            Zone::Graveyard,
+            "Pawn B sacrificed"
+        );
+        assert_eq!(
+            state.objects.get(&p1_c).unwrap().zone,
+            Zone::Battlefield,
+            "Pawn C not chosen, still on battlefield"
+        );
+        assert_eq!(
+            state.objects.get(&p0_own).unwrap().zone,
+            Zone::Battlefield,
+            "attacker controller's permanent never threatened"
+        );
+    }
+
+    /// CR 701.16b: when the resolved sacrifice count meets or exceeds the
+    /// defending player's eligible pool and the effect is mandatory, every
+    /// eligible permanent is sacrificed. Annihilator 2 against a defender
+    /// with only one permanent must sacrifice that one permanent (and not
+    /// hang waiting for the second choice).
+    #[test]
+    fn annihilator_with_fewer_permanents_than_n_sacrifices_all_of_them() {
+        let face = annihilator_creature_face("Ulamog's Echo", 2);
+
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = crate::types::phase::Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let only_one = place_dummy_permanent(&mut state, PlayerId(1), "Sole Pawn");
+
+        let _attacker =
+            attack_and_resolve_to_sacrifice(&mut state, &face, PlayerId(0), PlayerId(1));
+
+        // CR 701.16b fast-path: the resolver takes the mandatory-all branch
+        // and does not park in EffectZoneChoice — the sole permanent goes
+        // straight to the graveyard.
+        assert_eq!(
+            state.objects.get(&only_one).unwrap().zone,
+            Zone::Graveyard,
+            "the sole eligible permanent is sacrificed in the mandatory-all path"
+        );
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "no EffectZoneChoice — fewer permanents than N means CR 701.16b \
+             auto-sacrifices the entire pool"
+        );
+    }
+
+    /// CR 508.5a multiplayer invariant: when an attacker with Annihilator
+    /// attacks P1 in a 3-player game, only P1 sacrifices — P2 (a defending
+    /// player not being attacked by THIS creature) is unaffected. This is
+    /// the key correctness property that distinguishes
+    /// `ControllerRef::DefendingPlayer` (per-attacker lookup) from a hypo-
+    /// thetical "each opponent" sacrifice.
+    #[test]
+    fn annihilator_in_multiplayer_targets_defending_player_not_all_opponents() {
+        let face = annihilator_creature_face("Kozilek's Echo", 1);
+
+        // CR 802.1: multiplayer game. Use the 3-player constructor so the
+        // sacrifice pool resolution can distinguish "defending player" from
+        // "each opponent".
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        state.turn_number = 2;
+        state.phase = crate::types::phase::Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        // P1 (defending) has 2 permanents; P2 (uninvolved) has 1 permanent.
+        let p1_a = place_dummy_permanent(&mut state, PlayerId(1), "P1 Pawn A");
+        let p1_b = place_dummy_permanent(&mut state, PlayerId(1), "P1 Pawn B");
+        let p2_only = place_dummy_permanent(&mut state, PlayerId(2), "P2 Pawn");
+
+        let _attacker =
+            attack_and_resolve_to_sacrifice(&mut state, &face, PlayerId(0), PlayerId(1));
+
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                assert_eq!(
+                    *player,
+                    PlayerId(1),
+                    "only the defending player (P1) chooses — never P2"
+                );
+                assert!(cards.contains(&p1_a) && cards.contains(&p1_b));
+                assert!(
+                    !cards.contains(&p2_only),
+                    "P2's permanent must NOT be in the sacrifice pool; only \
+                     the per-attacker defending player (P1) sacrifices \
+                     (CR 508.5a)"
+                );
+            }
+            other => panic!("expected EffectZoneChoice on P1, got {other:?}"),
+        }
     }
 }
 
