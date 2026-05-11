@@ -1156,10 +1156,15 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // are paid through the same pipeline as flashback's non-mana cost.
     let alt_ability_cost = state.objects.get(&object_id).and_then(|obj| {
         if obj.zone == Zone::Exile {
+            // CR 611.2a: Match the grantee filter used by
+            // `prepare_spell_cast_with_variant_override` so the alt-ability
+            // cost is only consumed by the granted player.
             obj.casting_permissions.iter().find_map(|p| match p {
                 crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
-                    cost, ..
-                } => Some(cost.clone()),
+                    cost,
+                    granted_to,
+                    ..
+                } if granted_to.is_none() || *granted_to == Some(player) => Some(cost.clone()),
                 _ => None,
             })
         } else if obj.zone == Zone::Library && obj.owner == player {
@@ -5189,6 +5194,7 @@ mod tests {
                         source_mv,
                         exiled_misses: vec![miss_a, miss_b],
                     }),
+                    granted_to: None,
                 });
 
             (state, hit, vec![miss_a, miss_b])

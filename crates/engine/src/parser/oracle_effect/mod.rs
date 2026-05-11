@@ -1448,6 +1448,9 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
                         cost,
                         cast_transformed: false,
                         constraint: None,
+                        // CR 611.2a: `grant_permission::resolve` binds this to
+                        // the ability controller at grant time.
+                        granted_to: None,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -7169,6 +7172,89 @@ fn try_parse_emblem_creation(lower: &str, original: &str) -> Option<Effect> {
 /// CR 601.2a + CR 118.9: Parse "cast it/that card [without paying its mana cost]".
 ///
 /// Three branches:
+/// CR 205.2 + CR 108.1: Parse a leading core-type disjunction with the
+/// "spell" / "card" informational suffix — "an instant or sorcery spell",
+/// "an instant or sorcery card". Returns a `TypedFilter` whose `type_filters`
+/// is the disjunctive set (evaluated via per-object OR in `filter.rs` —
+/// `matches_any_type_filter`).
+///
+/// `parse_type_phrase` handles single core types and adjective-conjunction
+/// ("artifact creature") but not " or " between bare core-type words. This
+/// helper covers the common cast-effect surface that needs the disjunctive
+/// form (Jeleva, Past in Flames, Mizzix's Mastery, Wandering Mind, and the
+/// wider "cast instant or sorcery from <zone>" class).
+fn parse_cast_type_disjunction(rest: &str) -> Option<TypedFilter> {
+    type E<'a> = OracleError<'a>;
+    fn parse_core(i: &str) -> nom::IResult<&str, TypeFilter, OracleError<'_>> {
+        alt((
+            value(TypeFilter::Instant, tag::<_, _, E>("instant")),
+            value(TypeFilter::Sorcery, tag("sorcery")),
+            value(TypeFilter::Creature, tag("creature")),
+            value(TypeFilter::Artifact, tag("artifact")),
+            value(TypeFilter::Enchantment, tag("enchantment")),
+            value(TypeFilter::Planeswalker, tag("planeswalker")),
+            value(TypeFilter::Land, tag("land")),
+            value(TypeFilter::Battle, tag("battle")),
+        ))
+        .parse(i)
+    }
+    // Strip optional "a "/"an " article.
+    let (rest, _) = opt(alt((tag::<_, _, E>("an "), tag("a "))))
+        .parse(rest)
+        .ok()?;
+    let (rest, first) = parse_core(rest).ok()?;
+    let (rest, _) = tag::<_, _, E>(" or ").parse(rest).ok()?;
+    let (rest, second) = parse_core(rest).ok()?;
+    // Require the informational "spell"/"card" suffix so we don't over-match
+    // bare disjunctions ("instant or sorcery" alone falls through to the
+    // normal parser path).
+    let (_rest, _) = alt((
+        tag::<_, _, E>(" spell"),
+        tag(" card"),
+        tag(" spells"),
+        tag(" cards"),
+    ))
+    .parse(rest)
+    .ok()?;
+    Some(TypedFilter {
+        type_filters: vec![first, second],
+        controller: None,
+        properties: Vec::new(),
+    })
+}
+
+/// CR 406.6 + CR 603.10a: Detect the `"from among cards exiled with [self-ref]"`
+/// anchor — the persistent per-source exile-link anaphor used by cards that
+/// reference their own tracked exile set from a later, independent ability
+/// (Jeleva, Nephalia's Scourge attack trigger reading from Jeleva's ETB exile
+/// set; Mizzix's Mastery sacrifice reference; and the wider class).
+///
+/// Composed via nom alternation over the self-reference variants the rest of
+/// the parser already accepts at the SelfObject scope: `~` (the normalized
+/// card name), `this creature`, `it`, `this spell`. The trailing-word matcher
+/// uses `tag()` rather than a leaf-level enum because the variants are
+/// orthographic spellings of the same `SelfRef` referent — parameterizing this
+/// would only proliferate `alt()` arms with no semantic difference.
+fn has_from_among_cards_exiled_with_self(rest: &str) -> bool {
+    type E<'a> = OracleError<'a>;
+    let Ok((after_anchor, _)) = take_until::<_, _, E>("from among cards exiled with ").parse(rest)
+    else {
+        return false;
+    };
+    let Ok((after_anchor, _)) = tag::<_, _, E>("from among cards exiled with ").parse(after_anchor)
+    else {
+        return false;
+    };
+    alt((
+        tag::<_, _, E>("~"),
+        tag("this creature"),
+        tag("this spell"),
+        tag("it"),
+    ))
+    .parse(after_anchor)
+    .is_ok()
+}
+
 /// 1. Anaphoric — "cast it", "cast that spell", "cast those cards" — target is
 ///    `ParentTarget` (refers to the cards exiled / chosen by a prior effect).
 /// 2. Constrained — "cast a [type-phrase] [from <zone>] [with mana value <bound>]
@@ -7250,6 +7336,56 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
     {
         return Some(Effect::CastFromZone {
             target: TargetFilter::ExiledBySource,
+            without_paying_mana_cost: without_paying,
+            mode,
+            cast_transformed: false,
+            alt_ability_cost: None,
+        });
+    }
+
+    // CR 406.6 + CR 603.10a: "[cast a <filter> spell] from among cards exiled
+    // with [self-ref]" — the persistent per-source exile-link anaphor.
+    // Distinct from Branch 1.5's per-resolution `from among them` anaphor:
+    // Jeleva, Nephalia's Scourge / Mizzix's Mastery / Riku of Two Reflections
+    // and the wider class of cards that exile cards on an earlier trigger
+    // (ETB / cast / first-strike-damage) and reference those exiled cards
+    // from a later, independent ability (attack trigger, sacrifice cost, etc.).
+    // The exile link lives on the source object across resolutions, so
+    // `TargetFilter::ExiledBySource` is the correct binding — the runtime
+    // resolves it via `linked_exile_cards_for_source`, which scopes to the
+    // permanent's persistent tracked-exile set.
+    //
+    // When a typed filter is present ("cast an instant or sorcery spell ..."),
+    // AND it with `ExiledBySource` so the cast is restricted both by card
+    // type and by the source-exile-link.
+    if has_from_among_cards_exiled_with_self(rest) {
+        // First try the disjunctive form ("an instant or sorcery spell ...")
+        // since `parse_type_phrase` doesn't currently handle " or " between
+        // bare core-type words. Then fall back to `parse_type_phrase` for
+        // single-type forms.
+        let typed_filter = parse_cast_type_disjunction(rest)
+            .map(TargetFilter::Typed)
+            .unwrap_or_else(|| super::oracle_target::parse_type_phrase(rest).0);
+        let target = if let TargetFilter::Typed(mut tf) = typed_filter {
+            // CR 406.1: source-linked exiled cards live in the Exile zone.
+            // Make the zone explicit so target legality (CR 601.2c) restricts
+            // the choice to exile-zone objects even before AND'ing with
+            // ExiledBySource.
+            if !tf
+                .properties
+                .iter()
+                .any(|p| matches!(p, FilterProp::InZone { .. }))
+            {
+                tf.properties.push(FilterProp::InZone { zone: Zone::Exile });
+            }
+            TargetFilter::And {
+                filters: vec![TargetFilter::Typed(tf), TargetFilter::ExiledBySource],
+            }
+        } else {
+            TargetFilter::ExiledBySource
+        };
+        return Some(Effect::CastFromZone {
+            target,
             without_paying_mana_cost: without_paying,
             mode,
             cast_transformed: false,
@@ -19970,6 +20106,51 @@ mod tests {
     }
 
     #[test]
+    fn jeleva_etb_each_player_exiles_top_x_resolves_to_mana_spent_to_cast() {
+        // Jeleva, Nephalia's Scourge ETB body. The `each player` outer scope
+        // routes through `strip_player_scope_subject` so `their library` binds
+        // to the iterating player (`TargetFilter::ScopedPlayer`). The `where
+        // X is the amount of mana spent to cast ~` suffix substitutes the
+        // bare `X` variable with the typed mana-spent quantity ref — without
+        // this binding the trigger would have no chosen X and the count
+        // would default to 0 at resolution time. (#326)
+        let def = parse_effect_chain(
+            "Each player exiles the top X cards of their library, where X is the amount of mana spent to cast ~.",
+            AbilityKind::Spell,
+        );
+        let Effect::ExileTop {
+            player,
+            count:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ManaSpentToCast {
+                            scope: crate::types::ability::CastManaObjectScope::SelfObject,
+                            metric: crate::types::ability::CastManaSpentMetric::Total,
+                        },
+                },
+        } = &*def.effect
+        else {
+            panic!(
+                "Expected ExileTop(<each-player>, ManaSpentToCast(SelfObject, Total)), got {:?}",
+                def.effect
+            );
+        };
+        assert!(
+            matches!(player, TargetFilter::ScopedPlayer),
+            "Expected per-iteration ScopedPlayer for `each player exiles their library`, got {:?}",
+            player
+        );
+        assert!(
+            matches!(
+                def.player_scope,
+                Some(crate::types::ability::PlayerFilter::All)
+            ),
+            "Expected outer player_scope=All so the trigger iterates once per player, got {:?}",
+            def.player_scope
+        );
+    }
+
+    #[test]
     fn exile_top_card_of_that_players_library_uses_parent_target() {
         let def = parse_effect_chain(
             "Exile the top card of that player's library. Until end of turn, you may cast that card.",
@@ -26859,6 +27040,78 @@ mod tests {
         };
         assert!(without_paying_mana_cost);
         assert_eq!(target, TargetFilter::ExiledBySource);
+    }
+
+    /// CR 406.6 + CR 603.10a: Jeleva, Nephalia's Scourge attack-trigger
+    /// surface — "cast an instant or sorcery spell from among cards exiled
+    /// with ~ without paying its mana cost." Distinct from the
+    /// per-resolution `from among them / those exiled cards` anaphor: the
+    /// "cards exiled with [self-ref]" form references the source's
+    /// persistent exile-link set published by a prior ETB trigger, NOT the
+    /// per-resolution tracked-set anchor. The cast must bind to
+    /// `TargetFilter::ExiledBySource` AND restrict by card type (instant /
+    /// sorcery) so the surface filters out non-castable card types in
+    /// Jeleva's exile zone (e.g., a planeswalker exiled by the ETB). (#326)
+    #[test]
+    fn cast_from_among_cards_exiled_with_self_binds_to_exiled_by_source_and_type() {
+        let e = parse_effect(
+            "cast an instant or sorcery spell from among cards exiled with ~ without paying its mana cost",
+        );
+        let Effect::CastFromZone {
+            target,
+            without_paying_mana_cost,
+            ..
+        } = e
+        else {
+            panic!("expected CastFromZone, got {:?}", e);
+        };
+        assert!(without_paying_mana_cost);
+        let TargetFilter::And { filters } = target else {
+            panic!(
+                "expected AND of typed filter + ExiledBySource, got {:?}",
+                target
+            );
+        };
+        assert!(
+            filters
+                .iter()
+                .any(|f| matches!(f, TargetFilter::ExiledBySource)),
+            "expected ExiledBySource leg in AND, got {:?}",
+            filters
+        );
+        let typed = filters
+            .iter()
+            .find_map(|f| match f {
+                TargetFilter::Typed(tf) => Some(tf),
+                _ => None,
+            })
+            .expect("expected typed-filter leg in AND");
+        assert!(
+            typed
+                .type_filters
+                .iter()
+                .any(|tf| matches!(tf, TypeFilter::Instant)),
+            "expected Instant in type_filters, got {:?}",
+            typed.type_filters
+        );
+        assert!(
+            typed
+                .type_filters
+                .iter()
+                .any(|tf| matches!(tf, TypeFilter::Sorcery)),
+            "expected Sorcery in type_filters, got {:?}",
+            typed.type_filters
+        );
+        assert!(
+            typed.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::InZone {
+                    zone: crate::types::zones::Zone::Exile
+                }
+            )),
+            "expected InZone(Exile) property, got {:?}",
+            typed.properties
+        );
     }
 
     /// CR 610.3: Mirror anaphor variant — "from among those exiled cards" —

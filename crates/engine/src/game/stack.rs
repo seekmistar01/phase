@@ -1735,6 +1735,7 @@ mod tests {
                     cost: ManaCost::generic(2),
                     cast_transformed: false,
                     constraint: None,
+                    granted_to: None,
                 });
         }
 

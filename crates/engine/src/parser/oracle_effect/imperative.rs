@@ -1363,6 +1363,9 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
                 cost,
                 cast_transformed: false,
                 constraint: None,
+                // CR 611.2a: bound to the ability controller by
+                // `grant_permission::resolve`.
+                granted_to: None,
             },
             target,
             grantee: Default::default(),
@@ -3459,31 +3462,47 @@ pub(super) fn parse_exile_ast(
     ctx: &mut ParseContext,
 ) -> Option<ZoneCounterImperativeAst> {
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("exile the top ").parse(lower) {
-        let (count, remainder) = if let Ok((rem, n)) = nom_primitives::parse_number.parse(rest) {
-            (QuantityExpr::Fixed { value: n as i32 }, rem.trim_start())
-        } else if let Ok((rem, _)) = tag::<_, _, OracleError<'_>>("x").parse(rest) {
-            (
-                QuantityExpr::Ref {
-                    qty: QuantityRef::Variable {
-                        name: "X".to_string(),
+        let (initial_count, remainder) =
+            if let Ok((rem, n)) = nom_primitives::parse_number.parse(rest) {
+                (QuantityExpr::Fixed { value: n as i32 }, rem.trim_start())
+            } else if let Ok((rem, _)) = tag::<_, _, OracleError<'_>>("x").parse(rest) {
+                (
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string(),
+                        },
                     },
-                },
-                rem.trim_start(),
-            )
-        } else {
-            (QuantityExpr::Fixed { value: 1 }, rest)
-        };
+                    rem.trim_start(),
+                )
+            } else {
+                (QuantityExpr::Fixed { value: 1 }, rest)
+            };
         let that_player = that_player_library_filter(ctx);
+        // CR 608.2: "their library" inside an outer "each player" / "each opponent"
+        // player_scope iteration binds to the iterating player. The chunk_ctx
+        // surfaces this via `relative_player_scope = ScopedPlayer`, which
+        // `that_player_library_filter` already maps to `TargetFilter::ScopedPlayer`.
+        // For the third-person "each player's library" alternate phrasing we also
+        // accept that variant directly.
         for (pattern, player) in [
             ("card of your library", TargetFilter::Controller),
             ("cards of your library", TargetFilter::Controller),
             ("card of that player's library", that_player.clone()),
-            ("cards of that player's library", that_player),
+            ("cards of that player's library", that_player.clone()),
+            ("card of their library", that_player.clone()),
+            ("cards of their library", that_player.clone()),
+            ("card of each player's library", TargetFilter::Player),
+            ("cards of each player's library", TargetFilter::Player),
         ] {
-            if tag::<_, _, OracleError<'_>>(pattern)
-                .parse(remainder)
-                .is_ok()
-            {
+            if let Ok((after_lib, _)) = tag::<_, _, OracleError<'_>>(pattern).parse(remainder) {
+                // CR 107.3i: Optional ", where x is <quantity expr>" suffix
+                // overrides the leading `Variable { "X" }` binding with the
+                // dynamic quantity expression. Mirrors the
+                // try_parse_token_enters_with_counters / put-counters-on-token
+                // followup patterns. Without this, the trigger has no chosen X
+                // (it's an ETB-triggered ability, not a cast), and the count
+                // would default to 0 at resolution time.
+                let count = resolve_exile_top_where_x_binding(after_lib, initial_count);
                 return Some(ZoneCounterImperativeAst::ExileTop { player, count });
             }
         }
@@ -3595,6 +3614,42 @@ fn that_player_library_filter(ctx: &ParseContext) -> TargetFilter {
         Some(TargetFilter::Player) => TargetFilter::TriggeringPlayer,
         _ => TargetFilter::ParentTarget,
     }
+}
+
+/// CR 107.3i: Resolve a `", where x is <quantity expr>"` suffix that follows an
+/// `Effect::ExileTop` body, overriding the leading `Variable { "X" }` binding
+/// with the dynamic quantity expression. Mirrors the X-binding suffix logic
+/// already used by `try_parse_token_enters_with_counters` for declarative
+/// "the token enters with X +1/+1 counters on it, where X is …" cards.
+///
+/// Trigger contexts have no chosen X (cast cost-X-paid only exists on a spell
+/// cast), so the parse-time substitution is the only way the resolver sees the
+/// dynamic count. When the suffix is missing or the inner phrase fails to
+/// parse to a known quantity, the original count (typically `Variable { "X" }`
+/// or `Fixed { value: N }`) is returned unchanged.
+fn resolve_exile_top_where_x_binding(after_lib: &str, initial_count: QuantityExpr) -> QuantityExpr {
+    let trimmed = after_lib
+        .trim_start()
+        .trim_start_matches([',', '.', ' '])
+        .trim_start();
+    let Ok((rest_where, _)) = alt((
+        tag::<_, _, OracleError<'_>>("where x is "),
+        tag("where X is "),
+    ))
+    .parse(trimmed) else {
+        return initial_count;
+    };
+    let qty_text = rest_where
+        .trim_end()
+        .trim_end_matches(['.', ','])
+        .trim_end();
+    if let Some(expr) = crate::parser::oracle_quantity::parse_event_context_quantity(qty_text) {
+        return expr;
+    }
+    if let Some(qty) = crate::parser::oracle_quantity::parse_quantity_ref(qty_text) {
+        return QuantityExpr::Ref { qty };
+    }
+    initial_count
 }
 
 pub(super) fn parse_counter_ast(text: &str, lower: &str) -> Option<ZoneCounterImperativeAst> {

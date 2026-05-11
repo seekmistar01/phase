@@ -257,13 +257,32 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
             .is_some_and(|obj| has_exile_cast_permission(obj, player, state.turn_number))
     }));
 
-    // CR 601.2a: Opponent's exiled cards with ExileWithAltCost are castable by any player.
-    // CastFromZone effects (e.g. Silent-Blade Oni, Etali) grant these permissions.
+    // CR 601.2a + CR 611.2a: Opponent's exiled cards with `ExileWithAltCost`
+    // / `ExileWithAltAbilityCost` are castable only by the player the
+    // resolving effect granted the permission to. When `granted_to` is
+    // `Some(p)` (Jeleva attack-trigger CastFromZone, Discover, Cascade), the
+    // cast is scoped to `p`; when `None` (legacy Silent-Blade Oni / Etali
+    // wiring that pre-dates the binding), fall back to any-opponent-of-owner
+    // semantics. This bypassed `has_exile_cast_permission` historically —
+    // the gate now matches the granted_to filter applied in the cost-reader.
     objects.extend(state.exile.iter().copied().filter(|&obj_id| {
-        state
-            .objects
-            .get(&obj_id)
-            .is_some_and(|obj| obj.owner != player && has_alt_cost_permission(obj))
+        state.objects.get(&obj_id).is_some_and(|obj| {
+            obj.owner != player
+                && obj.casting_permissions.iter().any(|p| match p {
+                    crate::types::ability::CastingPermission::ExileWithAltCost {
+                        granted_to,
+                        ..
+                    }
+                    | crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
+                        granted_to,
+                        ..
+                    } => match granted_to {
+                        Some(allowed) => *allowed == player,
+                        None => true,
+                    },
+                    _ => false,
+                })
+        })
     }));
 
     // CR 702.34 / CR 702.127 / CR 702.138 / CR 702.180: Cards in graveyard with
@@ -631,9 +650,22 @@ fn has_exile_cast_permission(
 ) -> bool {
     obj.casting_permissions.iter().any(|p| match p {
         crate::types::ability::CastingPermission::AdventureCreature
-        | crate::types::ability::CastingPermission::ExileWithAltCost { .. }
-        | crate::types::ability::CastingPermission::ExileWithAltAbilityCost { .. }
         | crate::types::ability::CastingPermission::ExileWithEnergyCost => obj.owner == player,
+        // CR 611.2a + CR 118.9: When `granted_to` is bound to a specific
+        // player (Jeleva's attack-trigger CastFromZone, Discover's
+        // discovering-player binding, Cascade's cascading-player binding,
+        // Airbending grants resolved through grant_permission::resolve), the
+        // cast permission is scoped to that player only. The legacy
+        // `owner == player` rule applies only when the field is None — for
+        // back-compat with construction sites that have not been threaded
+        // through `grant_permission::resolve` (today only test scaffolding).
+        crate::types::ability::CastingPermission::ExileWithAltCost { granted_to, .. }
+        | crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
+            granted_to, ..
+        } => match granted_to {
+            Some(p) => *p == player,
+            None => obj.owner == player,
+        },
         crate::types::ability::CastingPermission::PlayFromExile { granted_to, .. } => {
             *granted_to == player
         }
@@ -684,19 +716,27 @@ pub(super) fn player_can_spend_as_any_color_for_optional_spell(
             })
 }
 
-/// CR 601.2a: Check if an object has an alt-cost cast-from-exile permission
-/// (i.e., the spell may be cast by paying *something other than* its mana
-/// cost). Used to allow casting opponent's exiled cards (where ownership !=
-/// caster). Both the `ManaCost`-only `ExileWithAltCost` and the broader
-/// `ExileWithAltAbilityCost` (Nashi, "pay life equal to its mana value")
-/// satisfy this predicate.
-fn has_alt_cost_permission(obj: &crate::game::game_object::GameObject) -> bool {
-    obj.casting_permissions.iter().any(|p| {
-        matches!(
-            p,
-            crate::types::ability::CastingPermission::ExileWithAltCost { .. }
-                | crate::types::ability::CastingPermission::ExileWithAltAbilityCost { .. }
-        )
+/// CR 601.2a + CR 611.2a: Check if an object has an alt-cost cast-from-exile
+/// permission (i.e., the spell may be cast by paying *something other than*
+/// its mana cost) AND that permission either has no `granted_to` binding or
+/// binds to `player`. Used at cross-ownership cast surfaces where the card is
+/// in opponent-owned exile but the grant restricts the caster — Jeleva's
+/// attack-trigger CastFromZone, Discover, Cascade, and the Silent-Blade Oni /
+/// Etali legacy class (which leave `granted_to` as `None` and so fall back to
+/// the historical any-opponent-can-cast semantics).
+fn has_alt_cost_permission_for(
+    obj: &crate::game::game_object::GameObject,
+    player: PlayerId,
+) -> bool {
+    obj.casting_permissions.iter().any(|p| match p {
+        crate::types::ability::CastingPermission::ExileWithAltCost { granted_to, .. }
+        | crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
+            granted_to, ..
+        } => match granted_to {
+            Some(allowed) => *allowed == player,
+            None => true,
+        },
+        _ => false,
     })
 }
 
@@ -1138,10 +1178,13 @@ fn prepare_spell_cast_with_variant_override(
     };
     let has_top_of_library_permission = top_of_library_permission_src.is_some();
 
-    // CR 601.2a: CastFromZone effects grant ExileWithAltCost on opponent's cards,
-    // so ExileWithAltCost permits casting regardless of ownership.
+    // CR 601.2a + CR 611.2a: CastFromZone effects grant ExileWithAltCost on
+    // opponent's cards. When the grant carries a `granted_to: Some(p)`
+    // binding, only player `p` may consume it — see
+    // `spell_objects_available_to_cast` for the parallel filter used at the
+    // legal-actions surface.
     let has_unowned_exile_permission =
-        obj.zone == Zone::Exile && obj.owner != player && has_alt_cost_permission(obj);
+        obj.zone == Zone::Exile && obj.owner != player && has_alt_cost_permission_for(obj, player);
     let castable_zone = has_unowned_exile_permission
         || has_exile_permission
         || (obj.owner == player
@@ -1227,12 +1270,21 @@ fn prepare_spell_cast_with_variant_override(
     // routed through `pay_additional_cost` in `check_additional_cost_or_pay`
     // (CR 118.9 + CR 119.4).
     let alt_cost_from_exile = if obj.zone == Zone::Exile {
+        // CR 611.2a: When a permission carries `granted_to: Some(p)`, only
+        // player `p` may consume its cost override. Skip alt-cost permissions
+        // bound to a different player so a non-grantee casting from the same
+        // exiled card (theoretical — gated by `has_exile_cast_permission`
+        // first) cannot accidentally inherit Jeleva's "without paying its mana
+        // cost" cost-zero on cards exiled with Jeleva.
         obj.casting_permissions.iter().find_map(|p| match p {
-            crate::types::ability::CastingPermission::ExileWithAltCost { cost, .. } => {
-                Some(cost.clone())
-            }
+            crate::types::ability::CastingPermission::ExileWithAltCost {
+                cost, granted_to, ..
+            } if granted_to.is_none() || *granted_to == Some(player) => Some(cost.clone()),
             crate::types::ability::CastingPermission::Foretold { cost, .. } => Some(cost.clone()),
-            crate::types::ability::CastingPermission::ExileWithAltAbilityCost { .. } => {
+            crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
+                granted_to,
+                ..
+            } if granted_to.is_none() || *granted_to == Some(player) => {
                 Some(crate::types::mana::ManaCost::zero())
             }
             _ => None,
@@ -11924,6 +11976,7 @@ mod tests {
                 cost: ManaCost::generic(2),
                 cast_transformed: false,
                 constraint: None,
+                granted_to: None,
             });
 
         assert!(is_blocked_by_cast_only_from_zones(
@@ -13328,6 +13381,7 @@ mod tests {
                     cost: obj.mana_cost.clone(),
                     cast_transformed: false,
                     constraint: None,
+                    granted_to: None,
                 },
             );
         }

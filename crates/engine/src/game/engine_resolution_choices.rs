@@ -137,6 +137,9 @@ pub(super) fn handle_resolution_choice(
                             cost: crate::types::mana::ManaCost::zero(),
                             cast_transformed: false,
                             constraint: None,
+                            // CR 702.190a (Discover): the discovering player is
+                            // the only player permitted to cast the hit card.
+                            granted_to: Some(player),
                         },
                     );
                 }
@@ -183,6 +186,9 @@ pub(super) fn handle_resolution_choice(
                                     exiled_misses,
                                 },
                             ),
+                            // CR 702.85a (Cascade): the cascading player is the
+                            // only player permitted to cast the hit card.
+                            granted_to: Some(player),
                         },
                     );
                 }

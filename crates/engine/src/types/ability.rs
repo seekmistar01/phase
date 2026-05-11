@@ -1084,6 +1084,19 @@ pub enum CastingPermission {
         /// the stack — see `casting_costs::finalize_cast_with_phyrexian_choices`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<CastPermissionConstraint>,
+        /// CR 611.2a + CR 118.9: When `Some(p)`, only player `p` may cast under
+        /// this permission. The grant-issuing effect (typically an attack
+        /// trigger or ETB on a different controller's permanent) records the
+        /// controller of the ability that granted this permission so cards
+        /// owned by an *opponent* (e.g., cards exiled from each player's
+        /// library by Jeleva's ETB) can still be cast only by the granting
+        /// permanent's controller — not by the card's owner. When `None`,
+        /// `has_exile_cast_permission` falls back to the legacy
+        /// `obj.owner == player` rule (Discover, Cascade, Suspend, Airbending,
+        /// and other classes where the card is exiled from the would-be
+        /// caster's own zones, so owner == grantee anyway).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        granted_to: Option<PlayerId>,
     },
     /// CR 400.7i: Play from exile until duration expires (impulse draw).
     /// Building block for "exile top N, choose one, you may play it this turn" patterns.
@@ -1126,6 +1139,10 @@ pub enum CastingPermission {
         /// may proceed. Mirrors `ExileWithAltCost.constraint`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<CastPermissionConstraint>,
+        /// CR 611.2a + CR 118.9: Mirrors `ExileWithAltCost.granted_to`. See
+        /// that field for the full rationale on owner-versus-grantee binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        granted_to: Option<PlayerId>,
     },
     /// CR 702.185a: Warp — card may be cast from exile at its normal mana cost,
     /// but only after the specified turn ends. Persists for as long as card remains exiled.

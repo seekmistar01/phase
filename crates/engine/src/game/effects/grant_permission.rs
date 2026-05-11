@@ -109,6 +109,31 @@ pub fn resolve(
             if let CastingPermission::PlayFromExile { granted_to, .. } = &mut granted {
                 *granted_to = granted_to_pid;
             }
+            // CR 611.2a + CR 118.9: Bind `granted_to` for `ExileWithAltCost` and
+            // `ExileWithAltAbilityCost` to the resolved grantee. Without this
+            // step, an Airbender owned by the controller of the airbended card
+            // would grant a permission whose `has_exile_cast_permission` check
+            // falls back to `obj.owner == player` — which happens to coincide
+            // for Airbending today but breaks the moment an
+            // attack-trigger-style grant exiles cards from each opponent's
+            // library (Jeleva, Nephalia's Scourge) and grants the cast
+            // permission to its controller, not to each card's owner. Only
+            // overwrite parser-emitted `None` placeholders so call sites that
+            // computed a specific PlayerId (e.g., Discover/Cascade WaitingFor
+            // continuations) keep their existing binding.
+            match &mut granted {
+                CastingPermission::ExileWithAltCost {
+                    granted_to: granted_to @ None,
+                    ..
+                }
+                | CastingPermission::ExileWithAltAbilityCost {
+                    granted_to: granted_to @ None,
+                    ..
+                } => {
+                    *granted_to = Some(granted_to_pid);
+                }
+                _ => {}
+            }
             // CR 702.170a + CR 702.170d: `Plotted { turn_plotted }` is stamped
             // at grant-resolution time from `state.turn_number`, mirroring how
             // `PlayFromExile { granted_to }` is bound to a concrete `PlayerId`
