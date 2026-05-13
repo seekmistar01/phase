@@ -5158,9 +5158,29 @@ mod tests {
         assert!(matches!(
             *execute.effect,
             Effect::Choose {
-                choice_type: ChoiceType::Color,
+                choice_type: ChoiceType::Color { ref excluded },
                 persist: true,
-            }
+            } if excluded.is_empty()
+        ));
+    }
+
+    #[test]
+    fn as_enters_choose_a_color_other_than_white() {
+        let def = parse_replacement_line(
+            "As this land enters, choose a color other than white.",
+            "Citadel Gate",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert!(matches!(def.mode, ReplacementMode::Mandatory));
+        let execute = def.execute.as_ref().unwrap();
+        assert!(matches!(
+            *execute.effect,
+            Effect::Choose {
+                choice_type: ChoiceType::Color { ref excluded },
+                persist: true,
+            } if excluded == &vec![ManaColor::White]
         ));
     }
 

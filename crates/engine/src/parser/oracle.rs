@@ -1951,7 +1951,7 @@ pub(crate) fn parse_oracle_ir(
             let def = AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::Choose {
-                    choice_type: ChoiceType::Color,
+                    choice_type: ChoiceType::color(),
                     persist: true,
                 },
             )

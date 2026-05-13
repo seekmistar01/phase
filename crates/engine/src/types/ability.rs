@@ -1,7 +1,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de;
+use serde::ser::SerializeStructVariant;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use super::card_type::{CardType, CoreType, Supertype};
@@ -92,10 +94,16 @@ pub enum OpponentMayScope {
 }
 
 /// What kind of named choice the player must make at resolution time.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChoiceType {
     CreatureType,
-    Color,
+    Color {
+        /// Colors that cannot be chosen by this prompt.
+        ///
+        /// CR 105.1 + CR 105.4 define the five legal color choices; prompts such as
+        /// "choose a color other than white" restrict that set.
+        excluded: Vec<ManaColor>,
+    },
     OddOrEven,
     BasicLandType,
     CardType,
@@ -121,6 +129,134 @@ pub enum ChoiceType {
     Word,
     /// "Choose an artist" — selects a Magic card artist name.
     Artist,
+}
+
+impl ChoiceType {
+    pub fn color() -> Self {
+        Self::Color {
+            excluded: Vec::new(),
+        }
+    }
+
+    pub fn color_excluding(excluded: Vec<ManaColor>) -> Self {
+        Self::Color { excluded }
+    }
+}
+
+impl Serialize for ChoiceType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::CreatureType => {
+                serializer.serialize_unit_variant("ChoiceType", 0, "CreatureType")
+            }
+            Self::Color { excluded } => {
+                if excluded.is_empty() {
+                    serializer.serialize_unit_variant("ChoiceType", 1, "Color")
+                } else {
+                    let mut variant =
+                        serializer.serialize_struct_variant("ChoiceType", 1, "Color", 1)?;
+                    variant.serialize_field("excluded", excluded)?;
+                    variant.end()
+                }
+            }
+            Self::OddOrEven => serializer.serialize_unit_variant("ChoiceType", 2, "OddOrEven"),
+            Self::BasicLandType => {
+                serializer.serialize_unit_variant("ChoiceType", 3, "BasicLandType")
+            }
+            Self::CardType => serializer.serialize_unit_variant("ChoiceType", 4, "CardType"),
+            Self::CardName => serializer.serialize_unit_variant("ChoiceType", 5, "CardName"),
+            Self::NumberRange { min, max } => {
+                let mut variant =
+                    serializer.serialize_struct_variant("ChoiceType", 6, "NumberRange", 2)?;
+                variant.serialize_field("min", min)?;
+                variant.serialize_field("max", max)?;
+                variant.end()
+            }
+            Self::Labeled { options } => {
+                let mut variant =
+                    serializer.serialize_struct_variant("ChoiceType", 7, "Labeled", 1)?;
+                variant.serialize_field("options", options)?;
+                variant.end()
+            }
+            Self::LandType => serializer.serialize_unit_variant("ChoiceType", 8, "LandType"),
+            Self::Opponent => serializer.serialize_unit_variant("ChoiceType", 9, "Opponent"),
+            Self::Player => serializer.serialize_unit_variant("ChoiceType", 10, "Player"),
+            Self::TwoColors => serializer.serialize_unit_variant("ChoiceType", 11, "TwoColors"),
+            Self::Word => serializer.serialize_unit_variant("ChoiceType", 12, "Word"),
+            Self::Artist => serializer.serialize_unit_variant("ChoiceType", 13, "Artist"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChoiceType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ChoiceTypeRepr {
+            Unit(String),
+            Data(ChoiceTypeData),
+        }
+
+        #[derive(Deserialize)]
+        enum ChoiceTypeData {
+            Color {
+                #[serde(default)]
+                excluded: Vec<ManaColor>,
+            },
+            NumberRange {
+                min: u8,
+                max: u8,
+            },
+            Labeled {
+                options: Vec<String>,
+            },
+        }
+
+        match ChoiceTypeRepr::deserialize(deserializer)? {
+            ChoiceTypeRepr::Unit(value) => match value.as_str() {
+                "CreatureType" => Ok(Self::CreatureType),
+                "Color" => Ok(Self::color()),
+                "OddOrEven" => Ok(Self::OddOrEven),
+                "BasicLandType" => Ok(Self::BasicLandType),
+                "CardType" => Ok(Self::CardType),
+                "CardName" => Ok(Self::CardName),
+                "LandType" => Ok(Self::LandType),
+                "Opponent" => Ok(Self::Opponent),
+                "Player" => Ok(Self::Player),
+                "TwoColors" => Ok(Self::TwoColors),
+                "Word" => Ok(Self::Word),
+                "Artist" => Ok(Self::Artist),
+                other => Err(de::Error::unknown_variant(
+                    other,
+                    &[
+                        "CreatureType",
+                        "Color",
+                        "OddOrEven",
+                        "BasicLandType",
+                        "CardType",
+                        "CardName",
+                        "LandType",
+                        "Opponent",
+                        "Player",
+                        "TwoColors",
+                        "Word",
+                        "Artist",
+                    ],
+                )),
+            },
+            ChoiceTypeRepr::Data(data) => match data {
+                ChoiceTypeData::Color { excluded } => Ok(Self::Color { excluded }),
+                ChoiceTypeData::NumberRange { min, max } => Ok(Self::NumberRange { min, max }),
+                ChoiceTypeData::Labeled { options } => Ok(Self::Labeled { options }),
+            },
+        }
+    }
 }
 
 /// The five basic land types (CR 305.6).
@@ -319,7 +455,7 @@ impl ChosenAttribute {
     /// Which category of choice this represents.
     pub fn choice_type(&self) -> ChoiceType {
         match self {
-            Self::Color(_) => ChoiceType::Color,
+            Self::Color(_) => ChoiceType::color(),
             Self::CreatureType(_) => ChoiceType::CreatureType,
             Self::BasicLandType(_) => ChoiceType::BasicLandType,
             Self::CardType(_) => ChoiceType::CardType,
@@ -377,7 +513,10 @@ pub enum ChoiceValue {
 impl ChoiceValue {
     pub fn from_choice(choice_type: &ChoiceType, value: &str) -> Option<Self> {
         match choice_type {
-            ChoiceType::Color => value.parse::<ManaColor>().ok().map(Self::Color),
+            ChoiceType::Color { excluded } => {
+                let color = value.parse::<ManaColor>().ok()?;
+                (!excluded.contains(&color)).then_some(Self::Color(color))
+            }
             ChoiceType::CreatureType => Some(Self::CreatureType(value.to_string())),
             ChoiceType::BasicLandType => {
                 value.parse::<BasicLandType>().ok().map(Self::BasicLandType)
@@ -9216,6 +9355,41 @@ fn is_zero_u32(value: &u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choice_type_color_deserializes_legacy_unit_variant() {
+        let choice_type: ChoiceType = serde_json::from_str("\"Color\"").unwrap();
+
+        assert_eq!(choice_type, ChoiceType::color());
+    }
+
+    #[test]
+    fn choice_type_color_deserializes_excluded_colors() {
+        let choice_type: ChoiceType =
+            serde_json::from_str(r#"{"Color":{"excluded":["White"]}}"#).unwrap();
+
+        assert_eq!(
+            choice_type,
+            ChoiceType::Color {
+                excluded: vec![ManaColor::White],
+            }
+        );
+    }
+
+    #[test]
+    fn restricted_color_choice_value_rejects_excluded_color() {
+        assert_eq!(
+            ChoiceValue::from_choice(
+                &ChoiceType::color_excluding(vec![ManaColor::White]),
+                "White",
+            ),
+            None
+        );
+        assert_eq!(
+            ChoiceValue::from_choice(&ChoiceType::color_excluding(vec![ManaColor::White]), "Blue"),
+            Some(ChoiceValue::Color(ManaColor::Blue))
+        );
+    }
 
     #[test]
     fn target_ref_object_variant() {

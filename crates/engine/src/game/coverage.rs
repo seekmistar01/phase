@@ -1155,7 +1155,13 @@ fn fmt_mana_production(mp: &ManaProduction) -> String {
 fn fmt_choice_type(ct: &ChoiceType) -> String {
     match ct {
         ChoiceType::CreatureType => "creature type",
-        ChoiceType::Color => "color",
+        ChoiceType::Color { excluded } => {
+            if excluded.is_empty() {
+                "color"
+            } else {
+                "restricted color"
+            }
+        }
         ChoiceType::OddOrEven => "odd or even",
         ChoiceType::BasicLandType => "basic land type",
         ChoiceType::CardType => "card type",

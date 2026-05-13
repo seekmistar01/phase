@@ -1732,7 +1732,7 @@ fn try_parse_become_choice(
         )
     } else if lower.contains("color") {
         // CR 105.3: "become the color of your choice" — player chooses a color.
-        (ChoiceType::Color, ContinuousModification::AddChosenColor)
+        (ChoiceType::color(), ContinuousModification::AddChosenColor)
     } else {
         return None;
     };

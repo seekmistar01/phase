@@ -8043,8 +8043,15 @@ pub(crate) fn try_parse_named_choice(lower: &str) -> Option<ChoiceType> {
     type E<'a> = OracleError<'a>;
     if tag::<_, _, E>("a creature type").parse(rest).is_ok() {
         Some(ChoiceType::CreatureType)
+    } else if let Ok((_, excluded)) = preceded(
+        tag::<_, _, E>("a color other than "),
+        nom_primitives::parse_color,
+    )
+    .parse(rest)
+    {
+        Some(ChoiceType::color_excluding(vec![excluded]))
     } else if tag::<_, _, E>("a color").parse(rest).is_ok() {
-        Some(ChoiceType::Color)
+        Some(ChoiceType::color())
     } else if tag::<_, _, E>("odd or even").parse(rest).is_ok() {
         Some(ChoiceType::OddOrEven)
     } else if tag::<_, _, E>("a basic land type").parse(rest).is_ok() {
@@ -8908,9 +8915,9 @@ fn collapse_ephemeral_color_choice_mana(def: &mut AbilityDefinition) {
     if matches!(
         &*def.effect,
         Effect::Choose {
-            choice_type: ChoiceType::Color,
+            choice_type: ChoiceType::Color { excluded },
             persist: false,
-        }
+        } if excluded.is_empty()
     ) {
         let can_collapse = def.sub_ability.as_ref().is_some_and(|sub| {
             matches!(
@@ -18411,7 +18418,7 @@ mod tests {
         assert_eq!(
             e,
             Effect::Choose {
-                choice_type: ChoiceType::Color,
+                choice_type: ChoiceType::color(),
                 persist: false
             }
         );

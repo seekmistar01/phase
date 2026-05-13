@@ -12801,7 +12801,7 @@ mod phase_trigger_regression_tests {
         // Set up NamedChoice with source_id (simulating persist=true Choose)
         state.waiting_for = WaitingFor::NamedChoice {
             player: PlayerId(0),
-            choice_type: ChoiceType::Color,
+            choice_type: ChoiceType::color(),
             options: vec![
                 "White".to_string(),
                 "Blue".to_string(),
@@ -12823,6 +12823,34 @@ mod phase_trigger_regression_tests {
         // Verify the choice was stored on the object
         let obj = state.objects.get(&obj_id).unwrap();
         assert_eq!(obj.chosen_color(), Some(ManaColor::Red));
+    }
+
+    #[test]
+    fn restricted_color_choice_rejects_excluded_color() {
+        use crate::types::ability::ChoiceType;
+        use crate::types::mana::ManaColor;
+
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::NamedChoice {
+            player: PlayerId(0),
+            choice_type: ChoiceType::color_excluding(vec![ManaColor::White]),
+            options: vec![
+                "Blue".to_string(),
+                "Black".to_string(),
+                "Red".to_string(),
+                "Green".to_string(),
+            ],
+            source_id: None,
+        };
+
+        let result = apply_as_current(
+            &mut state,
+            GameAction::ChooseOption {
+                choice: "White".to_string(),
+            },
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
