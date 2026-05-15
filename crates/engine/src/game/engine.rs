@@ -3298,7 +3298,16 @@ fn apply_action(
                 triggers::push_pending_trigger_to_stack(state, pending_trigger, &mut events);
                 state.priority_passes.clear();
                 state.priority_pass_count = 0;
-                WaitingFor::Priority { player: p }
+                // CR 113.2c + CR 603.2 + CR 603.3b: Drain siblings deferred
+                // behind this distribute-among trigger so each independent
+                // instance reaches the stack (issue #416).
+                if let Some(waiting_for) =
+                    triggers::drain_deferred_trigger_queue(state, &mut events)
+                {
+                    waiting_for
+                } else {
+                    WaitingFor::Priority { player: p }
+                }
             } else {
                 // Resolution-time distribution continuation path.
                 state.waiting_for = WaitingFor::Priority { player: p };

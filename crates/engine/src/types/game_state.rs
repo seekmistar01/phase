@@ -2995,6 +2995,16 @@ pub struct GameState {
     /// trigger context, consumed when the pending trigger is put on the stack.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_trigger_event_batch: Vec<GameEvent>,
+    /// CR 113.2c + CR 603.2 + CR 603.3b: Queue of triggers that fired in the
+    /// same pass but were deferred because an earlier trigger needed player
+    /// input (modal choice, target selection, or division). Each instance of a
+    /// printed ability fires independently, so multiple copies of the same
+    /// permanent (e.g., two Boggart Pranksters seeing "you attack") must each
+    /// reach the stack. Drained in FIFO order by
+    /// `triggers::drain_deferred_trigger_queue` after the active
+    /// `pending_trigger` is pushed to the stack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_triggers: Vec<crate::game::triggers::DeferredTrigger>,
 
     // CR 607.2a + CR 406.5: Exile tracking for "until leaves" linked abilities.
     #[serde(default)]
@@ -3766,6 +3776,7 @@ impl GameState {
             spells_cast_last_turn: None,
             pending_trigger: None,
             pending_trigger_event_batch: Vec::new(),
+            deferred_triggers: Vec::new(),
             exile_links: Vec::new(),
             paradigm_primed: Vec::new(),
             delayed_triggers: Vec::new(),
@@ -4027,6 +4038,7 @@ impl PartialEq for GameState {
             && self.spells_cast_this_turn == other.spells_cast_this_turn
             && self.spells_cast_last_turn == other.spells_cast_last_turn
             && self.pending_trigger == other.pending_trigger
+            && self.deferred_triggers == other.deferred_triggers
             && self.exile_links == other.exile_links
             && self.paradigm_primed == other.paradigm_primed
             && self.delayed_triggers == other.delayed_triggers

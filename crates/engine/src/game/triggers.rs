@@ -124,11 +124,23 @@ struct MatchedTrigger {
     constraint: Option<crate::types::ability::TriggerConstraint>,
 }
 
-#[derive(Clone)]
-struct PendingTriggerContext {
-    pending: PendingTrigger,
-    trigger_events: Vec<GameEvent>,
+/// A trigger that has been collected and is queued for stack placement.
+///
+/// CR 113.2c + CR 603.2 + CR 603.3b: Each instance of a printed triggered
+/// ability fires independently. When two or more triggers fire in the same
+/// pass and one of them needs player input (modal choice, target selection,
+/// or division), the others must NOT be dropped — they wait in
+/// `GameState::deferred_triggers` and are drained after the active trigger
+/// is pushed to the stack.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingTriggerContext {
+    pub pending: PendingTrigger,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_events: Vec<GameEvent>,
 }
+
+/// Public alias for the deferred-queue element type used by `GameState`.
+pub type DeferredTrigger = PendingTriggerContext;
 
 impl PendingTriggerContext {
     fn single(pending: PendingTrigger) -> Self {
@@ -1351,127 +1363,22 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
     // CR 603.3b: LIFO means AP triggers resolve last (APNAP ordering).
     pending.reverse();
 
+    // CR 113.2c + CR 603.2 + CR 603.3b: Drive each collected trigger through
+    // its disposition (pushed to stack, resolved inline as a mana ability, or
+    // paused for player input). If `dispatch_pending_trigger_context` reports
+    // a pause, the remaining contexts are stashed into `deferred_triggers` so
+    // they reach the stack once the active `pending_trigger` is resolved by
+    // its dispatcher. Without this, every queued trigger after the first
+    // input-requiring one would be silently dropped (issue #416).
     let mut events_out = Vec::new();
-    for trigger_context in pending {
-        let PendingTriggerContext {
-            pending: mut trigger,
-            trigger_events,
-        } = trigger_context;
-        // CR 700.2b: Modal triggered ability — stash for mode selection before pushing to stack.
-        if trigger.modal.is_some() && !trigger.mode_abilities.is_empty() {
-            state.pending_trigger_event_batch = trigger_events;
-            state.pending_trigger = Some(trigger);
+    let mut iter = pending.into_iter();
+    while let Some(trigger_context) = iter.next() {
+        if dispatch_pending_trigger_context(state, trigger_context, &mut events_out) {
+            // Active trigger paused on player input. Stash the remaining
+            // contexts to be drained by `drain_deferred_trigger_queue` after
+            // the active trigger is finalized.
+            state.deferred_triggers.extend(iter);
             return;
-        }
-
-        let target_slots = match super::ability_utils::build_target_slots(state, &trigger.ability) {
-            Ok(target_slots) => target_slots,
-            Err(_) => continue,
-        };
-
-        if target_slots.is_empty() {
-            // CR 605.1b: Triggered mana abilities don't use the stack — they resolve
-            // immediately at the moment the trigger event occurs. Classify via the
-            // single-authority `is_triggered_mana_ability` (ResolvedAbility form),
-            // which enforces all three CR 605.1b criteria.
-            if super::mana_abilities::is_triggered_mana_ability(
-                &trigger.ability,
-                trigger.trigger_event.as_ref(),
-            ) {
-                super::mana_abilities::resolve_triggered_mana_ability_inline(
-                    state,
-                    &trigger.ability,
-                    trigger.trigger_event.as_ref(),
-                    &mut events_out,
-                );
-                continue;
-            }
-            push_pending_trigger_to_stack_with_event_batch(
-                state,
-                trigger,
-                trigger_events,
-                &mut events_out,
-            );
-            continue;
-        }
-
-        // CR 115.1 + CR 701.9b: Random-target triggered abilities short-circuit
-        // to RNG-driven selection. Falls back to controller-choice degenerate
-        // auto-select otherwise.
-        let auto_targets = if matches!(
-            trigger.ability.target_selection_mode,
-            crate::types::ability::TargetSelectionMode::Random
-        ) {
-            super::ability_utils::random_select_targets_for_ability(
-                state,
-                &target_slots,
-                &trigger.target_constraints,
-            )
-            .map(Some)
-        } else {
-            super::ability_utils::auto_select_targets_for_ability(
-                state,
-                &trigger.ability,
-                &target_slots,
-                &trigger.target_constraints,
-            )
-        };
-
-        match auto_targets {
-            Ok(Some(targets)) => {
-                if super::ability_utils::assign_targets_in_chain(
-                    state,
-                    &mut trigger.ability,
-                    &targets,
-                )
-                .is_err()
-                {
-                    continue;
-                }
-                super::casting::emit_targeting_events(
-                    state,
-                    &super::ability_utils::flatten_targets_in_chain(&trigger.ability),
-                    trigger.source_id,
-                    trigger.controller,
-                    &mut events_out,
-                );
-                if let Some(unit) = trigger.distribute.clone() {
-                    if let Some(total) = super::casting_targets::extract_fixed_distribution_total(
-                        &trigger.ability.effect,
-                    ) {
-                        let assigned_targets =
-                            super::ability_utils::flatten_targets_in_chain(&trigger.ability);
-                        if assigned_targets.len() == 1 {
-                            trigger.ability.distribution =
-                                Some(vec![(assigned_targets[0].clone(), total)]);
-                        } else {
-                            let player = trigger.controller;
-                            state.pending_trigger_event_batch = trigger_events;
-                            state.pending_trigger = Some(trigger);
-                            state.waiting_for =
-                                crate::types::game_state::WaitingFor::DistributeAmong {
-                                    player,
-                                    total,
-                                    targets: assigned_targets,
-                                    unit,
-                                };
-                            return;
-                        }
-                    }
-                }
-                push_pending_trigger_to_stack_with_event_batch(
-                    state,
-                    trigger,
-                    trigger_events,
-                    &mut events_out,
-                );
-            }
-            Ok(None) => {
-                state.pending_trigger_event_batch = trigger_events;
-                state.pending_trigger = Some(trigger);
-                return;
-            }
-            Err(_) => continue,
         }
     }
 
@@ -1570,6 +1477,178 @@ fn push_pending_trigger_to_stack_with_event_batch(
         },
     };
     stack::push_to_stack(state, entry, events);
+}
+
+/// CR 113.2c + CR 603.2 + CR 603.3b: Drive a single collected trigger through
+/// its disposition. Returns `true` when the trigger paused on player input
+/// (modal mode choice, target selection, or division-among) — callers must
+/// then stash the remaining queue into `state.deferred_triggers`. Returns
+/// `false` when the trigger reached the stack (or resolved inline as a mana
+/// ability, or was dropped because targets became illegal).
+///
+/// All three pause paths set `state.pending_trigger` / `state.waiting_for`
+/// (where appropriate) before returning so the engine's existing
+/// `begin_pending_trigger_target_selection` / mode-choice / distribute-among
+/// dispatchers pick up the active trigger unchanged.
+fn dispatch_pending_trigger_context(
+    state: &mut GameState,
+    trigger_context: PendingTriggerContext,
+    events_out: &mut Vec<GameEvent>,
+) -> bool {
+    let PendingTriggerContext {
+        pending: mut trigger,
+        trigger_events,
+    } = trigger_context;
+
+    // CR 700.2b: Modal triggered ability — stash for mode selection before
+    // pushing to stack. The engine's mode-choice handler reads
+    // `state.pending_trigger` and prompts the controller.
+    if trigger.modal.is_some() && !trigger.mode_abilities.is_empty() {
+        state.pending_trigger_event_batch = trigger_events;
+        state.pending_trigger = Some(trigger);
+        return true;
+    }
+
+    let target_slots = match super::ability_utils::build_target_slots(state, &trigger.ability) {
+        Ok(target_slots) => target_slots,
+        Err(_) => return false,
+    };
+
+    if target_slots.is_empty() {
+        // CR 605.1b: Triggered mana abilities don't use the stack — they resolve
+        // immediately at the moment the trigger event occurs. Classify via the
+        // single-authority `is_triggered_mana_ability` (ResolvedAbility form),
+        // which enforces all three CR 605.1b criteria.
+        if super::mana_abilities::is_triggered_mana_ability(
+            &trigger.ability,
+            trigger.trigger_event.as_ref(),
+        ) {
+            super::mana_abilities::resolve_triggered_mana_ability_inline(
+                state,
+                &trigger.ability,
+                trigger.trigger_event.as_ref(),
+                events_out,
+            );
+            return false;
+        }
+        push_pending_trigger_to_stack_with_event_batch(state, trigger, trigger_events, events_out);
+        return false;
+    }
+
+    // CR 115.1 + CR 701.9b: Random-target triggered abilities short-circuit
+    // to RNG-driven selection. Falls back to controller-choice degenerate
+    // auto-select otherwise.
+    let auto_targets = if matches!(
+        trigger.ability.target_selection_mode,
+        crate::types::ability::TargetSelectionMode::Random
+    ) {
+        super::ability_utils::random_select_targets_for_ability(
+            state,
+            &target_slots,
+            &trigger.target_constraints,
+        )
+        .map(Some)
+    } else {
+        super::ability_utils::auto_select_targets_for_ability(
+            state,
+            &trigger.ability,
+            &target_slots,
+            &trigger.target_constraints,
+        )
+    };
+
+    match auto_targets {
+        Ok(Some(targets)) => {
+            if super::ability_utils::assign_targets_in_chain(state, &mut trigger.ability, &targets)
+                .is_err()
+            {
+                return false;
+            }
+            super::casting::emit_targeting_events(
+                state,
+                &super::ability_utils::flatten_targets_in_chain(&trigger.ability),
+                trigger.source_id,
+                trigger.controller,
+                events_out,
+            );
+            if let Some(unit) = trigger.distribute.clone() {
+                if let Some(total) = super::casting_targets::extract_fixed_distribution_total(
+                    &trigger.ability.effect,
+                ) {
+                    let assigned_targets =
+                        super::ability_utils::flatten_targets_in_chain(&trigger.ability);
+                    if assigned_targets.len() == 1 {
+                        trigger.ability.distribution =
+                            Some(vec![(assigned_targets[0].clone(), total)]);
+                    } else {
+                        let player = trigger.controller;
+                        state.pending_trigger_event_batch = trigger_events;
+                        state.pending_trigger = Some(trigger);
+                        state.waiting_for = crate::types::game_state::WaitingFor::DistributeAmong {
+                            player,
+                            total,
+                            targets: assigned_targets,
+                            unit,
+                        };
+                        return true;
+                    }
+                }
+            }
+            push_pending_trigger_to_stack_with_event_batch(
+                state,
+                trigger,
+                trigger_events,
+                events_out,
+            );
+            false
+        }
+        Ok(None) => {
+            state.pending_trigger_event_batch = trigger_events;
+            state.pending_trigger = Some(trigger);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// CR 113.2c + CR 603.2 + CR 603.3b: Drain the deferred-trigger queue after
+/// the active `pending_trigger` has been resolved (target chosen, mode
+/// chosen, distribution assigned) and pushed to the stack. Each queued
+/// trigger is dispatched FIFO. If one of them pauses on player input, the
+/// caller returns the resulting `WaitingFor` (already set on `state`) and the
+/// queue retains the still-unprocessed remainder. If the queue fully drains,
+/// returns the events produced (caller appends them to its own event vec).
+///
+/// Returns `Some(waiting_for)` if the drain paused on a deferred trigger
+/// needing input (its target-selection / mode-choice / distribute-among
+/// `WaitingFor` to enter), or `None` if every deferred trigger reached the
+/// stack and the caller should continue with its existing `WaitingFor`
+/// (typically `Priority`).
+pub(crate) fn drain_deferred_trigger_queue(
+    state: &mut GameState,
+    events_out: &mut Vec<GameEvent>,
+) -> Option<crate::types::game_state::WaitingFor> {
+    while !state.deferred_triggers.is_empty() {
+        let next = state.deferred_triggers.remove(0);
+        if dispatch_pending_trigger_context(state, next, events_out) {
+            // Paused on player input — the dispatcher set
+            // `state.pending_trigger` (and `state.waiting_for` for
+            // distribute-among). Defer to the engine's existing transition
+            // logic: for target/mode selection the caller invokes
+            // `begin_pending_trigger_target_selection`; for distribute-among
+            // the dispatcher already set `state.waiting_for`.
+            if matches!(
+                state.waiting_for,
+                crate::types::game_state::WaitingFor::DistributeAmong { .. }
+            ) {
+                return Some(state.waiting_for.clone());
+            }
+            return super::engine::begin_pending_trigger_target_selection(state)
+                .ok()
+                .flatten();
+        }
+    }
+    None
 }
 
 /// CR 603.2d: Apply trigger doubling from `StaticMode::DoubleTriggers`
@@ -10018,6 +10097,180 @@ pub mod tests {
             state.stack.len(),
             1,
             "Arcane Adaptation's type-changing layer must make the entering creature match Evelyn's Vampire ETB trigger"
+        );
+    }
+
+    /// CR 113.2c + CR 603.2 + CR 603.3b: Issue #416 — Boggart Prankster.
+    /// Each instance of a printed triggered ability fires independently. Two
+    /// Boggart Pranksters on the battlefield each have a separate
+    /// `Whenever you attack, target attacking Goblin you control gets +1/+0`
+    /// trigger; both must reach the stack when the controller attacks. When
+    /// the first trigger's target selection requires player input (multiple
+    /// legal attacking Goblins), the second was silently dropped because
+    /// `process_triggers` early-returned without queuing remaining triggers.
+    /// The fix uses `state.deferred_triggers` to park siblings; this test
+    /// drives `declare_attackers` end-to-end and asserts both triggers reach
+    /// the stack via the player-choice resolution path.
+    #[test]
+    fn issue_416_two_boggart_pranksters_both_attack_triggers_reach_stack() {
+        use crate::game::combat::AttackTarget;
+        use crate::types::ability::PtValue;
+
+        let mut state = setup();
+        state.turn_number = 2;
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::DeclareAttackers {
+            player: PlayerId(0),
+            valid_attacker_ids: vec![],
+            valid_attack_targets: vec![],
+        };
+
+        // Boggart Prankster trigger: Whenever you attack, target attacking
+        // Goblin you control gets +1/+0 until end of turn.
+        let prankster_trigger = || {
+            TriggerDefinition::new(TriggerMode::YouAttack).execute(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::Pump {
+                    power: PtValue::Fixed(1),
+                    toughness: PtValue::Fixed(0),
+                    target: TargetFilter::Typed(
+                        TypedFilter::new(TypeFilter::Subtype("Goblin".to_string()))
+                            .controller(ControllerRef::You)
+                            .properties(vec![FilterProp::Attacking]),
+                    ),
+                },
+            ))
+        };
+
+        let make_prankster = |state: &mut GameState, name: &str| -> ObjectId {
+            let id = create_object(
+                state,
+                CardId(state.next_object_id),
+                PlayerId(0),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Goblin".to_string());
+            obj.card_types.subtypes.push("Rogue".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(1);
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+            obj.entered_battlefield_turn = Some(1);
+            obj.trigger_definitions.push(prankster_trigger());
+            std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).push(prankster_trigger());
+            id
+        };
+
+        let prankster_a = make_prankster(&mut state, "Boggart Prankster A");
+        let prankster_b = make_prankster(&mut state, "Boggart Prankster B");
+
+        // Declare both Pranksters attacking the opponent. Each Prankster is
+        // itself an attacking Goblin, so each trigger has TWO legal targets
+        // (prankster_a and prankster_b), forcing player-choice resolution.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DeclareAttackers {
+                attacks: vec![
+                    (prankster_a, AttackTarget::Player(PlayerId(1))),
+                    (prankster_b, AttackTarget::Player(PlayerId(1))),
+                ],
+            },
+        )
+        .expect("declare attackers");
+
+        // After declare_attackers, the engine should be prompting the
+        // attacker's controller to pick a target for the first triggered
+        // ability. The second trigger must be parked in `deferred_triggers`,
+        // not dropped.
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }),
+            "expected TriggerTargetSelection for first Prankster trigger, got {:?}",
+            state.waiting_for
+        );
+        assert!(state.pending_trigger.is_some(), "active trigger parked");
+        assert_eq!(
+            state.deferred_triggers.len(),
+            1,
+            "the second Prankster's trigger must wait in the deferred queue, \
+             not be dropped (issue #416)"
+        );
+
+        // Player chooses the second Prankster as target for the first trigger.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(prankster_b)),
+            },
+        )
+        .expect("first prankster choose target");
+
+        // Now the deferred trigger should be active, again prompting for a
+        // target choice (still two legal attacking Goblins).
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }),
+            "expected TriggerTargetSelection for second Prankster trigger, got {:?}",
+            state.waiting_for
+        );
+        assert!(state.pending_trigger.is_some());
+        assert_eq!(state.deferred_triggers.len(), 0);
+        // The first trigger should already be on the stack.
+        assert_eq!(
+            state.stack.len(),
+            1,
+            "first Prankster trigger pushed before second prompted"
+        );
+
+        // Player chooses the first Prankster as target for the second trigger.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(prankster_a)),
+            },
+        )
+        .expect("second prankster choose target");
+
+        // Both triggers are now on the stack.
+        assert_eq!(
+            state.stack.len(),
+            2,
+            "both Prankster attack triggers must reach the stack"
+        );
+        assert!(state.pending_trigger.is_none());
+        assert!(state.deferred_triggers.is_empty());
+
+        // Resolve both triggers by passing priority.
+        let mut safety = 20;
+        while !state.stack.is_empty() && safety > 0 {
+            crate::game::engine::apply_as_current(&mut state, GameAction::PassPriority)
+                .expect("pass priority");
+            safety -= 1;
+            // Break out if waiting_for changes to something interactive.
+            if !matches!(
+                state.waiting_for,
+                WaitingFor::Priority { .. } | WaitingFor::GameOver { .. }
+            ) {
+                break;
+            }
+        }
+
+        // Each Prankster pumped the other +1/+0 until end of turn.
+        let a = state.objects.get(&prankster_a).unwrap();
+        let b = state.objects.get(&prankster_b).unwrap();
+        assert_eq!(
+            a.power,
+            Some(2),
+            "Prankster A should be 2/1 after receiving +1/+0 from B's trigger"
+        );
+        assert_eq!(
+            b.power,
+            Some(2),
+            "Prankster B should be 2/1 after receiving +1/+0 from A's trigger"
         );
     }
 }
