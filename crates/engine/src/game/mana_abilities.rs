@@ -1453,7 +1453,7 @@ fn exile_self_for_mana_cost(
 /// CR 605.3a + CR 605.1a: Extract the nested `ManaCost` from an ability cost
 /// that contains a mana sub-cost (either at top level or inside a Composite).
 /// Returns `None` for costs with no mana payment component.
-fn mana_sub_cost_of(cost: &Option<AbilityCost>) -> Option<&ManaCost> {
+pub(crate) fn mana_sub_cost_of(cost: &Option<AbilityCost>) -> Option<&ManaCost> {
     match cost {
         Some(AbilityCost::Mana { cost }) => Some(cost),
         Some(AbilityCost::Composite { costs }) => costs.iter().find_map(|c| match c {

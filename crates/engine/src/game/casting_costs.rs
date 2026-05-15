@@ -3355,16 +3355,20 @@ pub fn max_x_value(state: &GameState, player: PlayerId, cost: &ManaCost) -> u32 
         .find(|p| p.id == player)
         .map_or(0, |p| p.mana_pool.total() as u32);
 
-    let all_producers: u32 = state
+    // CR 107.1b: Sum each producer's *actual* mana output. Counting producers
+    // as one mana apiece understated X for multi-mana sources (Sol Ring,
+    // bounce lands, `{T}: Add {C} for each ~`), capping the X chooser below
+    // what the caster could truly pay.
+    let producible: u32 = state
         .battlefield
         .iter()
-        .filter(|&&id| !mana_sources::activatable_mana_options(state, id, player).is_empty())
-        .count() as u32;
+        .map(|&id| mana_sources::max_mana_yield(state, id, player))
+        .sum();
 
     // CR 107.1b: Each `ManaCostShard::X` in the cost contributes `value` generic,
     // so for `{X}{X}` each point of X costs 2 mana. Dividing by `x_count` yields
     // the largest X the caster can actually afford.
-    let remaining = (pool + all_producers).saturating_sub(fixed_portion);
+    let remaining = (pool + producible).saturating_sub(fixed_portion);
     remaining / x_count
 }
 
