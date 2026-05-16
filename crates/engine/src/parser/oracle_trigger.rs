@@ -69,6 +69,10 @@ fn self_recursion_trigger_zone(ability: &crate::types::ability::AbilityDefinitio
             target: TargetFilter::SelfRef,
             ..
         } if *origin != Zone::Battlefield => Some(*origin),
+        crate::types::ability::Effect::Bounce {
+            target: TargetFilter::SelfRef,
+            destination,
+        } if destination.is_none_or(|zone| zone == Zone::Hand) => Some(Zone::Graveyard),
         _ => ability
             .sub_ability
             .as_deref()
@@ -4492,13 +4496,34 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
         return Some((TriggerMode::DayTimeChanges, def));
     }
 
-    if matches!(
-        lower,
-        "when you unlock this door" | "whenever you unlock this door"
-    ) {
+    fn parse_you_unlock_this_door(input: &str) -> OracleResult<'_, ()> {
+        all_consuming(preceded(
+            alt((tag("when "), tag("whenever "))),
+            value((), tag("you unlock this door")),
+        ))
+        .parse(input)
+    }
+    if parse_you_unlock_this_door(lower).is_ok() {
         let mut def = make_base();
         def.mode = TriggerMode::UnlockDoor;
         return Some((TriggerMode::UnlockDoor, def));
+    }
+
+    fn parse_you_fully_unlock_a_room(input: &str) -> OracleResult<'_, ()> {
+        all_consuming(preceded(
+            alt((tag("when "), tag("whenever "))),
+            value((), tag("you fully unlock a room")),
+        ))
+        .parse(input)
+    }
+    if parse_you_fully_unlock_a_room(lower).is_ok() {
+        let mut def = make_base();
+        def.mode = TriggerMode::FullyUnlock;
+        def.valid_target = Some(TargetFilter::Controller);
+        def.valid_card = Some(TargetFilter::Typed(
+            TypedFilter::default().subtype("Room".to_string()),
+        ));
+        return Some((TriggerMode::FullyUnlock, def));
     }
 
     // CR 701.62 + CR 701.62b: "Whenever you manifest dread" — actor-side
@@ -12206,6 +12231,48 @@ mod tests {
     fn trigger_unlock_door_mode() {
         let def = parse_trigger_line("When you unlock this door, draw a card.", "Door");
         assert_eq!(def.mode, TriggerMode::UnlockDoor);
+    }
+
+    #[test]
+    fn trigger_you_fully_unlock_a_room_mode() {
+        let def = parse_trigger_line(
+            "Whenever you fully unlock a Room, draw a card.",
+            "Entity Tracker",
+        );
+        assert_eq!(def.mode, TriggerMode::FullyUnlock);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().subtype("Room".to_string())
+            ))
+        );
+        assert!(matches!(
+            def.execute
+                .as_deref()
+                .map(|ability| ability.effect.as_ref()),
+            Some(Effect::Draw { .. })
+        ));
+    }
+
+    #[test]
+    fn trigger_you_fully_unlock_room_self_return_uses_graveyard_zone() {
+        let def = parse_trigger_line(
+            "Whenever you fully unlock a Room, you may return this card from your graveyard to your hand.",
+            "Fear of Infinity",
+        );
+        assert_eq!(def.mode, TriggerMode::FullyUnlock);
+        assert_eq!(def.trigger_zones, vec![Zone::Graveyard]);
+        assert!(def.optional);
+        assert!(matches!(
+            def.execute
+                .as_deref()
+                .map(|ability| ability.effect.as_ref()),
+            Some(Effect::Bounce {
+                target: TargetFilter::SelfRef,
+                destination: None,
+            })
+        ));
     }
 
     #[test]

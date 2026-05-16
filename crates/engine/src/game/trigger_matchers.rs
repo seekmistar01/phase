@@ -2131,7 +2131,12 @@ pub(super) fn match_fully_unlock(
         ..
     } = event
     {
-        *object_id == source_id && valid_player_matches(trigger, state, *player_id, source_id)
+        let card_matches = if trigger.valid_card.is_some() {
+            valid_card_matches(trigger, state, *object_id, source_id)
+        } else {
+            *object_id == source_id
+        };
+        card_matches && valid_player_matches(trigger, state, *player_id, source_id)
     } else {
         false
     }
@@ -2739,6 +2744,61 @@ mod tests {
             &fully_unlock_event,
             &fully_unlock_trigger,
             room,
+            &state
+        ));
+    }
+
+    #[test]
+    fn fully_unlock_room_trigger_matches_observer_with_room_filter() {
+        let mut state = setup();
+        let room = create_object(
+            &mut state,
+            CardId(20),
+            PlayerId(0),
+            "Test Room".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&room).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Room".to_string());
+        }
+        let observer = create_object(
+            &mut state,
+            CardId(21),
+            PlayerId(0),
+            "Entity Tracker".to_string(),
+            Zone::Battlefield,
+        );
+
+        let mut trigger = make_trigger(TriggerMode::FullyUnlock);
+        trigger.valid_target = Some(TargetFilter::Controller);
+        trigger.valid_card = Some(TargetFilter::Typed(
+            TypedFilter::default().subtype("Room".to_string()),
+        ));
+        let fully_unlock_event = GameEvent::RoomDoorUnlocked {
+            player_id: PlayerId(0),
+            object_id: room,
+            door: RoomDoor::Right,
+            fully_unlocked: true,
+        };
+        assert!(match_fully_unlock(
+            &fully_unlock_event,
+            &trigger,
+            observer,
+            &state
+        ));
+
+        let opponent_unlock_event = GameEvent::RoomDoorUnlocked {
+            player_id: PlayerId(1),
+            object_id: room,
+            door: RoomDoor::Right,
+            fully_unlocked: true,
+        };
+        assert!(!match_fully_unlock(
+            &opponent_unlock_event,
+            &trigger,
+            observer,
             &state
         ));
     }
