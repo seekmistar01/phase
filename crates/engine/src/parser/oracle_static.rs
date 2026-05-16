@@ -20,7 +20,9 @@ use super::oracle_nom::error::OracleResult;
 use super::oracle_nom::filter as nom_filter;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::target as nom_target;
-use super::oracle_quantity::{parse_cda_quantity, parse_for_each_clause, parse_quantity_ref};
+use super::oracle_quantity::{
+    parse_cda_quantity, parse_event_context_quantity, parse_for_each_clause, parse_quantity_ref,
+};
 use super::oracle_target::{
     parse_combat_status_prefix, parse_counter_suffix, parse_mana_value_suffix, parse_target,
     parse_that_clause_suffix, parse_type_phrase,
@@ -7394,7 +7396,12 @@ fn parse_dynamic_pt_in_text(
         return None; // No X variable — not a dynamic P/T pattern
     }
 
-    let quantity = parse_cda_quantity(where_x_expression?)?;
+    // CR 706.2 + CR 706.3b: "where X is the result" binds X to the preceding
+    // die roll's result. `parse_cda_quantity` has no "the result" arm; fall
+    // through to `parse_event_context_quantity`, which maps it to
+    // `EventContextAmount` (the same channel "that much"/"the result" use).
+    let wx = where_x_expression?;
+    let quantity = parse_cda_quantity(wx).or_else(|| parse_event_context_quantity(wx))?;
 
     let mut mods = Vec::new();
     if p_is_x {

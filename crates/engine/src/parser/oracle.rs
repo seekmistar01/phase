@@ -4422,6 +4422,51 @@ mod tests {
         }
     }
 
+    /// CR 706.2 + CR 706.3b: "where X is the result" binds X to the preceding
+    /// die roll. Hammer Helper's inline +X/+0 pump must parse as a dynamic
+    /// power modification referencing `EventContextAmount`, not be swallowed.
+    #[test]
+    fn hammer_helper_die_result_pump_parses_dynamic_power_no_warning() {
+        let r = parse(
+            "Gain control of target creature until end of turn. Untap that creature and roll a six-sided die. Until end of turn, it gains haste and gets +X/+0, where X is the result.",
+            "Hammer Helper",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert!(
+            r.parse_warnings
+                .iter()
+                .all(|warning| warning.to_string().split_whitespace().next()
+                    != Some("Swallow:DynamicQty")),
+            "unexpected DynamicQty warning: {:?}",
+            r.parse_warnings
+        );
+        assert_eq!(r.abilities.len(), 1);
+        // GainControl → Untap → RollDie → GenericEffect
+        let generic = r.abilities[0]
+            .sub_ability
+            .as_ref()
+            .and_then(|a| a.sub_ability.as_ref())
+            .and_then(|a| a.sub_ability.as_ref())
+            .expect("GenericEffect should be the 4th link of the chain");
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = generic.effect.as_ref()
+        else {
+            panic!("expected GenericEffect, got {:?}", generic.effect);
+        };
+        let mods = &static_abilities[0].modifications;
+        assert!(
+            mods.contains(&ContinuousModification::AddDynamicPower {
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+            }),
+            "expected AddDynamicPower(EventContextAmount), got {mods:?}"
+        );
+    }
+
     #[test]
     fn bhaal_myrkul_half_starting_life_static_has_typed_condition_no_dynamic_qty_warning() {
         for (name, subject) in [

@@ -661,6 +661,9 @@ pub(crate) fn extract_amount_from_event(event: &crate::types::events::GameEvent)
         GameEvent::CounterAdded { count, .. } => Some(*count as i32),
         GameEvent::CounterRemoved { count, .. } => Some(*count as i32),
         GameEvent::Discarded { .. } => Some(1),
+        // CR 706.2: the final number of a die roll is its result. Lets
+        // `EventContextAmount` resolve "where X is the result" pump effects.
+        GameEvent::DieRolled { result, .. } => Some(*result as i32),
         _ => None,
     }
 }
@@ -2555,5 +2558,17 @@ mod tests {
             vec![TargetRef::Object(c1)],
             "Should fall through to ability.targets when no other tier applies"
         );
+    }
+
+    /// CR 706.2: a die roll's result is the amount `EventContextAmount`
+    /// resolves "where X is the result" against.
+    #[test]
+    fn extract_amount_from_die_rolled_returns_result() {
+        let event = crate::types::events::GameEvent::DieRolled {
+            player_id: PlayerId(0),
+            sides: 8,
+            result: 7,
+        };
+        assert_eq!(extract_amount_from_event(&event), Some(7));
     }
 }
