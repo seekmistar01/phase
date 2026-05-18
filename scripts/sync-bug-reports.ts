@@ -60,6 +60,7 @@ const TRIAGE_ITEMS_PATH = "triage/triage-items.jsonl";
 const TRIAGE_DELTA_PATH = "triage/triage-delta.jsonl";
 const DASHBOARD_PATH = "triage/dashboard.md";
 const LEGACY_EXPORT_PATH = "tmp/discord-thread-messages.json";
+const CARD_DATA_PATH = "client/public/card-data.json";
 
 function defaultSyncState(): SyncState {
   return {
@@ -559,7 +560,11 @@ function applyGithubDedupe(
   let matchedClosed = 0;
 
   const deduped = items.map((item) => {
-    if (item.proposed_action !== "create_issue" && item.proposed_action !== "needs_human_review") {
+    if (
+      item.proposed_action !== "create_issue" &&
+      item.proposed_action !== "append_to_existing" &&
+      item.proposed_action !== "needs_human_review"
+    ) {
       return item;
     }
 
@@ -627,6 +632,83 @@ const TRACKED_REPLY_PREFIX = "🔗 Tracked in";
 const REACTION_EMOJI = "👀";
 const ISSUE_REPO = "phase-rs/phase";
 
+interface CardDataEntry {
+  oracle_text?: string | null;
+}
+
+let cardDataCache: Record<string, CardDataEntry> | null = null;
+let rawMessagesCache: RawDiscordMessage[] | null = null;
+
+function loadCardData(): Record<string, CardDataEntry> {
+  if (cardDataCache === null) {
+    cardDataCache = existsSync(CARD_DATA_PATH)
+      ? (JSON.parse(readFileSync(CARD_DATA_PATH, "utf8")) as Record<string, CardDataEntry>)
+      : {};
+  }
+  return cardDataCache;
+}
+
+function loadRawMessages(): RawDiscordMessage[] {
+  if (rawMessagesCache === null) {
+    rawMessagesCache = readJsonl<RawDiscordMessage>(MESSAGES_PATH);
+  }
+  return rawMessagesCache;
+}
+
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function containsCardReference(text: string, card: string, allowSingleWord: boolean): boolean {
+  const bracketed = new RegExp(`\\[\\[\\s*${escapeRegex(card)}\\s*\\]\\]`, "i");
+  if (bracketed.test(text)) return true;
+
+  const cardWords = card.trim().split(/\s+/);
+  if (!allowSingleWord && cardWords.length === 1) return false;
+
+  const phrase = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegex(card)}([^\\p{L}\\p{N}]|$)`, "iu");
+  return phrase.test(text);
+}
+
+function selectRelevantOracleCards(item: TriageItem): string[] {
+  const rawText = loadRawMessages()
+    .filter((message) => message.thread_id === item.thread_id)
+    .map((message) => message.content)
+    .join("\n");
+  const searchableText = `${item.thread_name}\n${item.summary}\n${rawText}`;
+  const threadTitle = item.thread_name.trim().toLowerCase();
+
+  return [...new Set(item.cards.map((card) => card.trim()).filter(Boolean))].filter((card) => {
+    const normalized = card.toLowerCase();
+    const exactThreadTitle = normalized === threadTitle;
+    return exactThreadTitle || containsCardReference(searchableText, card, false);
+  });
+}
+
+function buildVerifiedOracleTextSection(item: TriageItem): string[] {
+  const cards = selectRelevantOracleCards(item);
+  const uniqueCards = [...new Set(cards.map((card) => card.trim()).filter(Boolean))];
+  if (uniqueCards.length === 0) {
+    return [
+      `## Oracle text (verified from \`${CARD_DATA_PATH}\`)`,
+      `_No card names were detected for this report._`,
+    ];
+  }
+
+  const cardData = loadCardData();
+  const lines = [`## Oracle text (verified from \`${CARD_DATA_PATH}\`)`];
+  for (const card of uniqueCards) {
+    const entry = cardData[card.toLowerCase()];
+    lines.push(`### ${card}`);
+    if (entry?.oracle_text === undefined || entry.oracle_text === null || entry.oracle_text === "") {
+      lines.push(`_No exact card-data entry with Oracle text was found for \`${card}\`._`);
+      continue;
+    }
+    lines.push(entry.oracle_text);
+  }
+  return lines;
+}
+
 // NOTE: this module deliberately does NOT pre-judge threads. The orchestrator
 // (an LLM in chat) reads candidate threads, cross-references existing GH issues,
 // and decides per thread whether to file, dedupe, skip-resolved, etc. This
@@ -656,18 +738,21 @@ function buildIssueTitle(item: TriageItem): string {
 }
 
 function buildIssueBody(item: TriageItem): string {
+  const relevantCards = selectRelevantOracleCards(item);
   // The Discord source URL anchor is REQUIRED — applyGithubDedupe matches on it
   // so subsequent triage runs recognize this issue and do not re-create it.
   const lines = [
     `Reported in Discord: ${item.source_url}`,
     ``,
     `**Thread:** ${item.thread_name}`,
-    `**Cards:** ${item.cards.length > 0 ? item.cards.join(", ") : "_none detected_"}`,
+    `**Cards:** ${relevantCards.length > 0 ? relevantCards.join(", ") : "_none detected_"}`,
     `**Parser status:** ${item.parser_status}`,
     `**Extraction confidence:** ${item.extraction_confidence.toFixed(2)}`,
     ``,
     `## Summary`,
     item.summary || "_(no summary extracted — see Discord thread)_",
+    ``,
+    ...buildVerifiedOracleTextSection(item),
     ``,
     `---`,
     `<sub>report_id: \`${item.report_id}\` · discord: \`${item.thread_id}/${item.message_id}\`</sub>`,
