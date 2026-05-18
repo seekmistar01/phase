@@ -1120,10 +1120,12 @@ function EffectZoneModal({ data }: { data: EffectZoneChoice["data"] }) {
 
   if (!objects) return null;
 
+  const isTopdeck = data.effect_kind === "PutAtLibraryPosition";
+  const selectedOrder = isTopdeck ? Array.from(selected) : [];
+  const selectedOrderLabels = selectedOrder.map((_, index) => formatTopdeckOrderLabel(index));
   const isReady = isUpTo
     ? selected.size >= minCount && selected.size <= data.count
     : selected.size === data.count;
-  const isTopdeck = data.effect_kind === "PutAtLibraryPosition";
   const title = isSacrifice ? "Sacrifice" : isTopdeck ? "Put on Library" : "Put onto Battlefield";
   const subtitle = isSacrifice
     ? isUpTo
@@ -1144,11 +1146,12 @@ function EffectZoneModal({ data }: { data: EffectZoneChoice["data"] }) {
       : `Choose ${data.count} card${data.count > 1 ? "s" : ""} to put onto the battlefield`;
   const actionLabel = selected.size === 0 && isUpTo && minCount === 0
     ? (isSacrifice ? "Skip" : "Decline")
-    : `${isSacrifice ? "Confirm" : isTopdeck ? "Top" : "Put"} (${selected.size}/${data.count})`;
+    : isTopdeck && selectedOrderLabels.length > 0
+      ? `Put on top (${selectedOrderLabels.join(" -> ")})`
+      : `${isSacrifice ? "Confirm" : isTopdeck ? "Top" : "Put"} (${selected.size}/${data.count})`;
   const ringClass = isSacrifice ? "ring-red-400/80" : isTopdeck ? "ring-sky-300/80" : "ring-emerald-400/80";
   const overlayClass = isSacrifice ? "bg-red-500/20" : isTopdeck ? "bg-sky-500/20" : "bg-emerald-500/20";
   const badgeClass = isSacrifice ? "bg-red-500/90" : isTopdeck ? "bg-sky-500/90" : "bg-emerald-500/90";
-  const badgeLabel = isSacrifice ? "Sacrifice" : isTopdeck ? "Top" : "Put";
 
   return (
     <ChoiceOverlay
@@ -1161,6 +1164,12 @@ function EffectZoneModal({ data }: { data: EffectZoneChoice["data"] }) {
           const obj = objects[id];
           if (!obj) return null;
           const isSelected = selected.has(id);
+          const selectedIndex = selectedOrder.indexOf(id);
+          const badgeLabel = isSacrifice
+            ? "Sacrifice"
+            : isTopdeck && selectedIndex >= 0
+              ? formatTopdeckOrderLabel(selectedIndex)
+              : "Put";
           return (
             <motion.button
               key={id}
@@ -1194,6 +1203,13 @@ function EffectZoneModal({ data }: { data: EffectZoneChoice["data"] }) {
       </ScrollableCardStrip>
     </ChoiceOverlay>
   );
+}
+
+function formatTopdeckOrderLabel(index: number): string {
+  if (index === 0) return "Top";
+  const position = index + 1;
+  const suffix = position === 2 ? "nd" : position === 3 ? "rd" : "th";
+  return `${position}${suffix}`;
 }
 
 function DrawnThisTurnTopdeckModal({ data }: { data: DrawnThisTurnTopdeckChoice["data"] }) {

@@ -5,7 +5,7 @@ use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{ActionResult, GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
-use crate::types::player::PlayerId;
+use crate::types::player::{PlayerCounterKind, PlayerId};
 use crate::types::proposed_event::ProposedEvent;
 use crate::types::zones::Zone;
 
@@ -254,6 +254,20 @@ pub fn apply_debug_action(
             }
         }
 
+        DebugAction::ModifyPlayerCounters {
+            player_id,
+            counter_kind,
+            delta,
+        } => {
+            validate_player(state, player_id)?;
+            apply_player_counter_delta(state, player_id, counter_kind, delta, events);
+        }
+
+        DebugAction::ModifyEnergy { player_id, delta } => {
+            validate_player(state, player_id)?;
+            apply_energy_delta(state, player_id, delta, events);
+        }
+
         DebugAction::AddMana { player_id, mana } => {
             validate_player(state, player_id)?;
             if let Some(player) = state.players.iter_mut().find(|p| p.id == player_id) {
@@ -348,6 +362,58 @@ pub fn apply_debug_action(
         waiting_for: state.waiting_for.clone(),
         log_entries: vec![],
     })
+}
+
+fn apply_player_counter_delta(
+    state: &mut GameState,
+    player_id: PlayerId,
+    counter_kind: PlayerCounterKind,
+    delta: i32,
+    events: &mut Vec<GameEvent>,
+) {
+    let Some(player) = state.players.iter_mut().find(|p| p.id == player_id) else {
+        return;
+    };
+    let before = player.player_counter(&counter_kind);
+    if delta > 0 {
+        player.add_player_counters(&counter_kind, delta as u32);
+    } else if delta < 0 {
+        player.remove_player_counters(&counter_kind, delta.unsigned_abs());
+    }
+    let after = player.player_counter(&counter_kind);
+    let actual_delta = after as i32 - before as i32;
+    if actual_delta != 0 {
+        events.push(GameEvent::PlayerCounterChanged {
+            player: player_id,
+            counter_kind,
+            delta: actual_delta,
+        });
+    }
+}
+
+fn apply_energy_delta(
+    state: &mut GameState,
+    player_id: PlayerId,
+    delta: i32,
+    events: &mut Vec<GameEvent>,
+) {
+    let Some(player) = state.players.iter_mut().find(|p| p.id == player_id) else {
+        return;
+    };
+    let before = player.energy;
+    if delta > 0 {
+        player.energy += delta as u32;
+    } else if delta < 0 {
+        player.energy = player.energy.saturating_sub(delta.unsigned_abs());
+    }
+    let after = player.energy;
+    let actual_delta = after as i32 - before as i32;
+    if actual_delta != 0 {
+        events.push(GameEvent::EnergyChanged {
+            player: player_id,
+            delta: actual_delta,
+        });
+    }
 }
 
 /// CR 400.7 + CR 614.1: Route a debug-created object through the standard
@@ -576,6 +642,152 @@ mod tests {
             PlayerId(0),
             "control must transfer back and persist across re-evaluation",
         );
+    }
+
+    #[test]
+    fn debug_modify_player_counters_routes_poison_to_dedicated_field() {
+        let mut state = sandbox_state();
+
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::ModifyPlayerCounters {
+                player_id: PlayerId(1),
+                counter_kind: PlayerCounterKind::Poison,
+                delta: 3,
+            }),
+        )
+        .expect("debug ModifyPlayerCounters should succeed");
+
+        assert_eq!(state.players[1].poison_counters, 3);
+        assert_eq!(
+            state.players[1]
+                .player_counters
+                .get(&PlayerCounterKind::Poison),
+            None
+        );
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::PlayerCounterChanged {
+                player: PlayerId(1),
+                counter_kind: PlayerCounterKind::Poison,
+                delta: 3,
+            }
+        )));
+    }
+
+    #[test]
+    fn debug_modify_player_counters_routes_generic_kinds_to_map() {
+        let mut state = sandbox_state();
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::ModifyPlayerCounters {
+                player_id: PlayerId(0),
+                counter_kind: PlayerCounterKind::Experience,
+                delta: 2,
+            }),
+        )
+        .expect("debug ModifyPlayerCounters should succeed");
+
+        assert_eq!(
+            state.players[0].player_counter(&PlayerCounterKind::Experience),
+            2
+        );
+    }
+
+    #[test]
+    fn debug_modify_player_counters_removal_reports_actual_delta() {
+        let mut state = sandbox_state();
+        state.players[0].add_player_counters(&PlayerCounterKind::Rad, 2);
+
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::ModifyPlayerCounters {
+                player_id: PlayerId(0),
+                counter_kind: PlayerCounterKind::Rad,
+                delta: -5,
+            }),
+        )
+        .expect("debug ModifyPlayerCounters should succeed");
+
+        assert_eq!(state.players[0].player_counter(&PlayerCounterKind::Rad), 0);
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::PlayerCounterChanged {
+                player: PlayerId(0),
+                counter_kind: PlayerCounterKind::Rad,
+                delta: -2,
+            }
+        )));
+    }
+
+    #[test]
+    fn debug_modify_absent_player_counter_emits_no_event() {
+        let mut state = sandbox_state();
+
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::ModifyPlayerCounters {
+                player_id: PlayerId(0),
+                counter_kind: PlayerCounterKind::Ticket,
+                delta: -1,
+            }),
+        )
+        .expect("debug ModifyPlayerCounters should succeed");
+
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::PlayerCounterChanged { .. })));
+    }
+
+    #[test]
+    fn debug_modify_energy_reports_actual_delta() {
+        let mut state = sandbox_state();
+        state.players[0].energy = 2;
+
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::ModifyEnergy {
+                player_id: PlayerId(0),
+                delta: -5,
+            }),
+        )
+        .expect("debug ModifyEnergy should succeed");
+
+        assert_eq!(state.players[0].energy, 0);
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::EnergyChanged {
+                player: PlayerId(0),
+                delta: -2,
+            }
+        )));
+    }
+
+    #[test]
+    fn debug_modify_absent_energy_emits_no_event() {
+        let mut state = sandbox_state();
+
+        let result = crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::ModifyEnergy {
+                player_id: PlayerId(0),
+                delta: -1,
+            }),
+        )
+        .expect("debug ModifyEnergy should succeed");
+
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, GameEvent::EnergyChanged { .. })));
     }
 
     /// CR 704.5f negative control: a debug-created 0/0 creature token

@@ -825,15 +825,30 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             player,
             counter_kind,
             delta,
-        } => vec![
-            player_seg(state, *player),
-            text(&format!(
-                " gets {} {} counter{}",
-                delta,
-                counter_kind,
-                if *delta != 1 { "s" } else { "" }
-            )),
-        ],
+        } => {
+            let count = delta.unsigned_abs();
+            if *delta > 0 {
+                vec![
+                    player_seg(state, *player),
+                    text(&format!(
+                        " gets {} {} counter{}",
+                        count,
+                        counter_kind,
+                        if count != 1 { "s" } else { "" }
+                    )),
+                ]
+            } else {
+                vec![
+                    player_seg(state, *player),
+                    text(&format!(
+                        " loses {} {} counter{}",
+                        count,
+                        counter_kind,
+                        if count != 1 { "s" } else { "" }
+                    )),
+                ]
+            }
+        }
 
         GameEvent::ManaExpended {
             player_id,
