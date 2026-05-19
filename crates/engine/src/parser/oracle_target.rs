@@ -1000,10 +1000,31 @@ pub fn parse_target_with_ctx<'a>(text: &'a str, ctx: &mut ParseContext) -> (Targ
             for &(zone_word, zone) in ZONE_WORDS {
                 if let Ok((zone_rest, _)) = tag::<_, _, OracleError<'_>>(zone_word).parse(rest) {
                     let consumed = lower.len() - zone_rest.len();
+                    // CR 110.1 + CR 108.3: a graveyard/hand/library card is not a
+                    // permanent and has no controller — membership is keyed by
+                    // owner. CR 109.5: "their" in an each-player iteration binds
+                    // to the iterated player (ControllerRef::ScopedPlayer),
+                    // distinct from "your" (the controller). Emit FilterProp::Owned,
+                    // not a controller match. Other possessives keep the existing
+                    // ControllerRef::You behavior (distinct referents resolved
+                    // upstream via the subject/target slot).
+                    let (controller, properties) = if poss == "their" {
+                        (
+                            None,
+                            vec![
+                                FilterProp::Owned {
+                                    controller: ControllerRef::ScopedPlayer,
+                                },
+                                FilterProp::InZone { zone },
+                            ],
+                        )
+                    } else {
+                        (Some(ControllerRef::You), vec![FilterProp::InZone { zone }])
+                    };
                     return (
                         TargetFilter::Typed(TypedFilter {
-                            controller: Some(ControllerRef::You),
-                            properties: vec![FilterProp::InZone { zone }],
+                            controller,
+                            properties,
                             ..Default::default()
                         }),
                         &text[consumed..],
@@ -4049,7 +4070,10 @@ enum ZoneQual {
     Opponent,
     /// "your " — sets `ControllerRef::You` on the parent filter.
     You,
-    /// "their ", "its owner's ", "that player's ", "defending player's ", "each player's ".
+    /// "their " — produces `Owned{ScopedPlayer}`; in an each-player iteration
+    /// the third-person possessive binds to the iterated player.
+    Their,
+    /// "its owner's ", "that player's ", "defending player's ", "each player's ".
     /// No ownership constraint emitted; referent is resolved by context upstream.
     OtherPoss,
     /// "a ", "the ", or nothing (e.g., "from exile").
@@ -4100,6 +4124,9 @@ pub(crate) fn scan_zone_phrase(
 /// - Opponent possessive: "from an opponent's graveyard", "from each opponent's graveyard"
 ///   → `[Owned{Opponent}, InZone]` so stolen creatures that died are still matched by owner.
 /// - Your: "from your graveyard" → `InZone` + `ControllerRef::You`.
+/// - "Their": "from their graveyard" → `[Owned{ScopedPlayer}, InZone]` so in an
+///   each-player iteration the candidate set is scoped to the iterated player's
+///   own graveyard (CR 110.1/108.3: membership is owner-keyed).
 /// - Other possessive / indefinite / definite / bare: → `InZone` alone.
 pub(crate) fn parse_zone_suffix(
     text: &str,
@@ -4147,6 +4174,20 @@ fn parse_zone_suffix_nom(
             None,
         ),
         ZoneQual::You => (vec![FilterProp::InZone { zone }], Some(ControllerRef::You)),
+        // CR 110.1 + CR 108.3: a graveyard/hand/library card is not a permanent
+        // and has no controller — membership is keyed by owner. CR 109.5:
+        // "their" in an each-player iteration binds to the iterated player
+        // (ControllerRef::ScopedPlayer), distinct from "your" (the controller).
+        // Emit FilterProp::Owned, not a controller match.
+        ZoneQual::Their => (
+            vec![
+                FilterProp::Owned {
+                    controller: ControllerRef::ScopedPlayer,
+                },
+                FilterProp::InZone { zone },
+            ],
+            None,
+        ),
         ZoneQual::OtherPoss | ZoneQual::Plain => (vec![FilterProp::InZone { zone }], None),
     };
     Ok((i, out))
@@ -4159,10 +4200,10 @@ fn parse_zone_qual(i: &str) -> super::oracle_nom::error::OracleResult<'_, ZoneQu
             alt((tag("an opponent's "), tag("each opponent's "))),
         ),
         value(ZoneQual::You, tag("your ")),
+        value(ZoneQual::Their, tag("their ")),
         value(
             ZoneQual::OtherPoss,
             alt((
-                tag("their "),
                 tag("its owner's "),
                 tag("that player's "),
                 tag("defending player's "),
@@ -8189,18 +8230,86 @@ mod tests {
 
     #[test]
     fn parse_target_bare_possessive_graveyard() {
+        // CR 110.1/108.3/109.5: bare "their graveyard" scopes by owner to the
+        // iterated player (ScopedPlayer), not by controller to the caster.
         let (f, rest) = parse_target("their graveyard");
         assert_eq!(
             f,
             TargetFilter::Typed(TypedFilter {
-                controller: Some(ControllerRef::You),
-                properties: vec![FilterProp::InZone {
-                    zone: Zone::Graveyard
-                }],
+                controller: None,
+                properties: vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::ScopedPlayer,
+                    },
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard
+                    }
+                ],
                 ..Default::default()
             })
         );
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn parse_target_their_graveyard_scopes_to_owner() {
+        // "from their graveyard" routes through parse_zone_suffix_nom; the
+        // possessive owner must survive as Owned{ScopedPlayer}.
+        let (f, _) = parse_target("a creature card from their graveyard");
+        let tf = typed_leg(&f).expect("typed filter");
+        assert_eq!(tf.controller, None);
+        assert!(has_prop(
+            tf,
+            FilterProp::Owned {
+                controller: ControllerRef::ScopedPlayer,
+            }
+        ));
+        assert!(has_prop(
+            tf,
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_target_bare_their_graveyard_scopes_to_owner() {
+        // Part B bare-possessive path: bare "their graveyard" must match the
+        // owner-scoped shape produced by parse_zone_suffix_nom's ZoneQual::Their.
+        let (f, _) = parse_target("their graveyard");
+        let tf = typed_leg(&f).expect("typed filter");
+        assert_eq!(tf.controller, None);
+        assert!(has_prop(
+            tf,
+            FilterProp::Owned {
+                controller: ControllerRef::ScopedPlayer,
+            }
+        ));
+        assert!(has_prop(
+            tf,
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_target_that_players_graveyard_unchanged() {
+        // The OtherPoss split must not regress non-"their" possessives:
+        // "that player's graveyard" emits InZone with no Owned prop.
+        let (f, _) = parse_target("a card from that player's graveyard");
+        let tf = typed_leg(&f).expect("typed filter");
+        assert_eq!(tf.controller, None);
+        assert!(has_prop(
+            tf,
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }
+        ));
+        assert!(!tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::Owned { .. })));
     }
 
     #[test]

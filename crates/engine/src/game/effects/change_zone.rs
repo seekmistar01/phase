@@ -770,9 +770,11 @@ pub fn resolve_all(
         // Player-scoped mass move: select every card in any of the origin zones
         // belonging to the target player, regardless of type.
         //
-        // CR 404.2 + CR 110.2: Hand / library / graveyard / exile membership is
-        // keyed by *owner*, not controller — only permanents on the battlefield
-        // have a controller. A creature stolen via Mind Control retains
+        // CR 110.1 + CR 108.3: Hand / library / graveyard / exile membership is
+        // keyed by *owner*, not controller — only a card on the battlefield is a
+        // permanent (CR 110.1) and thus has a controller; ownership (CR 108.3)
+        // is the player who started the game with the card. A creature stolen
+        // via Mind Control retains
         // `obj.controller = thief` even after dying into its owner's graveyard
         // (`reset_for_battlefield_exit` does not reset controller; only the
         // layer pass over `battlefield_phased_in_ids` does, and it skips zones
@@ -2355,6 +2357,227 @@ mod tests {
             !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
             "should not prompt for zone choice when optional targeting chose 0"
         );
+    }
+
+    /// Build an Exhume-shaped ability: `Effect::ChangeZone` Graveyard →
+    /// Battlefield with a `Typed{Creature}` target carrying the post-fix
+    /// owner constraint `Owned{ScopedPlayer}` + `InZone Graveyard`, and
+    /// `player_scope: All`. Issue #488 regression scaffold.
+    fn make_exhume_ability(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+        let mut ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![crate::types::ability::TypeFilter::Creature],
+                    controller: None,
+                    properties: vec![
+                        FilterProp::Owned {
+                            controller: ControllerRef::ScopedPlayer,
+                        },
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                    ],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                under_your_control: false,
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+            },
+            vec![],
+            source_id,
+            controller,
+        );
+        ability.player_scope = Some(PlayerFilter::All);
+        ability
+    }
+
+    /// Place a `Creature` card into `owner`'s graveyard and return its id.
+    fn creature_in_graveyard(state: &mut GameState, cid: u64, owner: PlayerId) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(cid),
+            owner,
+            format!("Creature {cid}"),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        id
+    }
+
+    /// Issue #488: Exhume must offer each iterated player ONLY the creatures in
+    /// that player's own graveyard — never another player's. Drives the
+    /// `player_scope` iteration through `resolve_ability_chain` and the
+    /// `EffectZoneChoice` continuation chain.
+    #[test]
+    fn exhume_each_player_picks_from_own_graveyard() {
+        let mut state = GameState::new_two_player(42);
+        // Two creatures per player so the choice prompt fires (a single
+        // eligible card auto-resolves without a prompt).
+        let p0_a = creature_in_graveyard(&mut state, 1, PlayerId(0));
+        let p0_b = creature_in_graveyard(&mut state, 2, PlayerId(0));
+        let p1_a = creature_in_graveyard(&mut state, 3, PlayerId(1));
+        let p1_b = creature_in_graveyard(&mut state, 4, PlayerId(1));
+
+        let ability = make_exhume_ability(ObjectId(900), PlayerId(0));
+        let mut events = Vec::new();
+        crate::game::effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        // First APNAP iteration: the active player is offered ONLY their own
+        // graveyard creatures.
+        let first_player = match &state.waiting_for {
+            WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                let mut sorted = cards.clone();
+                sorted.sort_by_key(|o| o.0);
+                if *player == PlayerId(0) {
+                    let mut expect = vec![p0_a, p0_b];
+                    expect.sort_by_key(|o| o.0);
+                    assert_eq!(sorted, expect, "P0 must see only P0's graveyard");
+                } else {
+                    let mut expect = vec![p1_a, p1_b];
+                    expect.sort_by_key(|o| o.0);
+                    assert_eq!(sorted, expect, "P1 must see only P1's graveyard");
+                }
+                *player
+            }
+            other => panic!("expected EffectZoneChoice, got {other:?}"),
+        };
+
+        // Resolve the first player's choice; continuation advances to the
+        // second player, who must see only THEIR graveyard.
+        let first_pick = if first_player == PlayerId(0) {
+            p0_a
+        } else {
+            p1_a
+        };
+        crate::game::engine::apply_as_current(
+            &mut state,
+            crate::types::actions::GameAction::SelectCards {
+                cards: vec![first_pick],
+            },
+        )
+        .unwrap();
+
+        let second_player = match &state.waiting_for {
+            WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                assert_ne!(
+                    *player, first_player,
+                    "second iteration is the other player"
+                );
+                let mut sorted = cards.clone();
+                sorted.sort_by_key(|o| o.0);
+                if *player == PlayerId(0) {
+                    let mut expect = vec![p0_a, p0_b];
+                    expect.sort_by_key(|o| o.0);
+                    assert_eq!(sorted, expect, "P0 must see only P0's graveyard");
+                } else {
+                    let mut expect = vec![p1_a, p1_b];
+                    expect.sort_by_key(|o| o.0);
+                    assert_eq!(sorted, expect, "P1 must see only P1's graveyard");
+                }
+                *player
+            }
+            other => panic!("expected second EffectZoneChoice, got {other:?}"),
+        };
+
+        let second_pick = if second_player == PlayerId(0) {
+            p0_a
+        } else {
+            p1_a
+        };
+        crate::game::engine::apply_as_current(
+            &mut state,
+            crate::types::actions::GameAction::SelectCards {
+                cards: vec![second_pick],
+            },
+        )
+        .unwrap();
+
+        // Both chosen creatures are on the battlefield under their owners.
+        assert_eq!(
+            state.objects.get(&first_pick).unwrap().zone,
+            Zone::Battlefield
+        );
+        assert_eq!(
+            state.objects.get(&second_pick).unwrap().zone,
+            Zone::Battlefield
+        );
+        assert_eq!(state.objects.get(&p0_a).unwrap().owner, PlayerId(0));
+        assert_eq!(state.objects.get(&p1_a).unwrap().owner, PlayerId(1));
+    }
+
+    /// Issue #488 — MANDATORY 3-player coverage. A 2-player test can mask
+    /// owner-vs-controller confusion (the wrong fallback might still resolve to
+    /// a single default). With three players, each iterated player's
+    /// `EffectZoneChoice.cards` must contain ONLY that player's own graveyard
+    /// creatures — proving the per-iteration `source.controller` rebind drives
+    /// `ScopedPlayer` correctly.
+    #[test]
+    fn exhume_three_players_each_scoped_to_own_graveyard() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        // Two creatures per player so every iteration prompts a choice.
+        let p0: Vec<ObjectId> = vec![
+            creature_in_graveyard(&mut state, 1, PlayerId(0)),
+            creature_in_graveyard(&mut state, 2, PlayerId(0)),
+        ];
+        let p1: Vec<ObjectId> = vec![
+            creature_in_graveyard(&mut state, 3, PlayerId(1)),
+            creature_in_graveyard(&mut state, 4, PlayerId(1)),
+        ];
+        let p2: Vec<ObjectId> = vec![
+            creature_in_graveyard(&mut state, 5, PlayerId(2)),
+            creature_in_graveyard(&mut state, 6, PlayerId(2)),
+        ];
+        let own_set = |pid: PlayerId| -> Vec<ObjectId> {
+            let mut v = match pid {
+                PlayerId(0) => p0.clone(),
+                PlayerId(1) => p1.clone(),
+                _ => p2.clone(),
+            };
+            v.sort_by_key(|o| o.0);
+            v
+        };
+
+        // Exhume controlled by P1 — proves APNAP anchoring and scoping are
+        // independent of the caster.
+        let ability = make_exhume_ability(ObjectId(900), PlayerId(1));
+        let mut events = Vec::new();
+        crate::game::effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (player, pick) = match &state.waiting_for {
+                WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                    let mut sorted = cards.clone();
+                    sorted.sort_by_key(|o| o.0);
+                    assert_eq!(
+                        sorted,
+                        own_set(*player),
+                        "player {player:?} must be offered only their own graveyard"
+                    );
+                    (*player, cards[0])
+                }
+                other => panic!("expected EffectZoneChoice, got {other:?}"),
+            };
+            assert!(!seen.contains(&player), "each player iterated exactly once");
+            seen.push(player);
+            crate::game::engine::apply_as_current(
+                &mut state,
+                crate::types::actions::GameAction::SelectCards { cards: vec![pick] },
+            )
+            .unwrap();
+        }
+        assert_eq!(seen.len(), 3, "all three players iterated");
     }
 
     /// CR 603.10a / Academy Rector class: LTB self-exile triggers fire after the
