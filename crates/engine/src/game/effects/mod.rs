@@ -340,6 +340,15 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             events.push(GameEvent::EffectResolved { kind, source_id });
         }
     }
+    // CR 614.12b + CR 614.1c + CR 614.13: Resume a paused multi-target
+    // `ChangeZone` iteration (issue #535). Drained FIRST — before
+    // `pending_repeat_iteration` — because the outer `repeat_for` loop may
+    // have stashed a chain that contains this inner ChangeZone iteration, and
+    // the outer loop must not advance until the inner ChangeZone completes
+    // and emits its `EffectResolved` event.
+    if !waits_for_resolution_choice(&state.waiting_for) {
+        drain_pending_change_zone_iteration(state, events);
+    }
     // CR 609.3 + CR 109.5: After the per-iteration chain drains, drive any
     // remaining `repeat_for` iterations. Each resumed iteration may itself
     // pause and re-stash via the loop in `resolve_ability_chain`, producing a
@@ -381,6 +390,83 @@ fn drain_pending_repeat_until(state: &mut GameState) {
             };
         }
         None => {}
+    }
+}
+
+/// CR 614.12b + CR 614.1c + CR 614.13: Resume a multi-target `ChangeZone`
+/// loop paused when an object's ETB triggered a per-permanent replacement
+/// choice (issue #535). Drives the remaining objects through
+/// `process_one_zone_move`; re-stashes and breaks on a further `NeedsChoice`;
+/// emits the trailing `EffectResolved` event when the loop completes.
+fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    while let Some(pending) = state.pending_change_zone_iteration.take() {
+        let crate::types::game_state::PendingChangeZoneIteration {
+            remaining,
+            source_id,
+            controller,
+            origin,
+            destination,
+            enter_transformed,
+            enter_tapped,
+            under_your_control,
+            enters_attacking,
+            enter_with_counters,
+            duration,
+            track_exiled_by_source,
+            effect_kind,
+        } = pending;
+        let ctx = crate::game::effects::change_zone::ChangeZoneIterationCtx {
+            source_id,
+            controller,
+            origin,
+            destination,
+            enter_transformed,
+            enter_tapped,
+            under_your_control,
+            enters_attacking,
+            enter_with_counters,
+            duration,
+            track_exiled_by_source,
+        };
+        let mut paused = false;
+        for (i, obj_id) in remaining.iter().enumerate() {
+            match crate::game::effects::change_zone::process_one_zone_move(
+                state, &ctx, *obj_id, events,
+            ) {
+                crate::game::effects::change_zone::ZoneMoveResult::Done => {}
+                crate::game::effects::change_zone::ZoneMoveResult::NeedsChoice(player) => {
+                    state.pending_change_zone_iteration =
+                        Some(crate::types::game_state::PendingChangeZoneIteration {
+                            remaining: remaining[i + 1..].to_vec(),
+                            source_id: ctx.source_id,
+                            controller: ctx.controller,
+                            origin: ctx.origin,
+                            destination: ctx.destination,
+                            enter_transformed: ctx.enter_transformed,
+                            enter_tapped: ctx.enter_tapped,
+                            under_your_control: ctx.under_your_control,
+                            enters_attacking: ctx.enters_attacking,
+                            enter_with_counters: ctx.enter_with_counters.clone(),
+                            duration: ctx.duration.clone(),
+                            track_exiled_by_source: ctx.track_exiled_by_source,
+                            effect_kind,
+                        });
+                    state.waiting_for =
+                        crate::game::replacement::replacement_choice_waiting_for(player, state);
+                    paused = true;
+                    break;
+                }
+            }
+        }
+        if paused {
+            break;
+        }
+        // Loop completed — emit the trailing EffectResolved event that the
+        // non-pause path emits at the tail of `change_zone::resolve`.
+        events.push(GameEvent::EffectResolved {
+            kind: effect_kind,
+            source_id: ctx.source_id,
+        });
     }
 }
 

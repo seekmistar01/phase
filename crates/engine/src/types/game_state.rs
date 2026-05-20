@@ -646,6 +646,49 @@ pub struct PendingRepeatIteration {
     pub total_iterations: usize,
 }
 
+/// CR 614.12b + CR 614.1c + CR 614.13: Resume state for a multi-target
+/// `ChangeZone` resolution loop paused when one of the moving objects
+/// triggered a per-permanent replacement choice (shock-land "pay 2 life?",
+/// check-land reveal prompt, Sutured Ghoul / Vesuva copy-as-enters, any
+/// `MayCost`/`Optional` replacement on entering the battlefield).
+///
+/// The loop in `change_zone::resolve` (and the analogous `EffectZoneChoice`
+/// multi-card loop in `engine_resolution_choices`) calls `execute_zone_move`
+/// per object. When one returns `ZoneMoveResult::NeedsChoice(player)`, the
+/// handler must set `waiting_for = ReplacementChoice` and return — leaving
+/// the remaining objects unmoved. Without this resume primitive, those
+/// remaining objects are silently dropped (issue #535: Skyshroud Claim
+/// chooses two shock lands; only the first ever entered the battlefield).
+///
+/// The struct stashes the per-iteration context (`ChangeZoneIterationCtx`)
+/// plus the unprocessed object ids; `drain_pending_change_zone_iteration`
+/// (in `effects/mod.rs`) re-enters the loop after each `ReplacementChoice`
+/// resolves. Drained BEFORE `pending_repeat_iteration` because the outer
+/// `repeat_for` loop may have stashed a chain that contains this inner
+/// ChangeZone iteration.
+///
+/// Mirrors `PendingRepeatIteration`'s stash-and-drain shape; the only new
+/// fields are the captured ChangeZone parameters needed to resume identically
+/// to the live `resolve` path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChangeZoneIteration {
+    pub remaining: Vec<ObjectId>,
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+    pub origin: Option<crate::types::zones::Zone>,
+    pub destination: crate::types::zones::Zone,
+    pub enter_transformed: bool,
+    pub enter_tapped: bool,
+    pub under_your_control: bool,
+    pub enters_attacking: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<crate::types::ability::Duration>,
+    pub track_exiled_by_source: bool,
+    pub effect_kind: crate::types::ability::EffectKind,
+}
+
 /// CR 608.2c + CR 107.1c: Resume state for a "repeat this process" loop
 /// (`RepeatContinuation`) paused when an iteration's process entered an
 /// interactive `WaitingFor` state.
@@ -3569,6 +3612,16 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_repeat_iteration: Option<PendingRepeatIteration>,
 
+    /// CR 614.12b + CR 614.1c + CR 614.13: Pending multi-target `ChangeZone`
+    /// iteration loop paused mid-flight because one of the moving objects
+    /// triggered a per-permanent replacement choice. Drained by
+    /// `drain_pending_continuation` BEFORE `pending_repeat_iteration` so the
+    /// inner ChangeZone iteration completes (and its `EffectResolved` event
+    /// fires) before the outer repeat loop advances. See
+    /// [`PendingChangeZoneIteration`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_change_zone_iteration: Option<PendingChangeZoneIteration>,
+
     /// CR 608.2c + CR 107.1c: Pending "repeat this process" loop paused because
     /// an iteration's process entered an interactive `WaitingFor` state.
     /// Drained by `drain_pending_continuation` after `pending_continuation`,
@@ -4107,6 +4160,7 @@ impl GameState {
             revealed_cards: HashSet::new(),
             pending_continuation: None,
             pending_repeat_iteration: None,
+            pending_change_zone_iteration: None,
             pending_repeat_until: None,
             pending_choose_one_of: None,
             pending_optional_effect: None,
@@ -4377,6 +4431,7 @@ impl PartialEq for GameState {
             && self.modal_modes_chosen_this_game == other.modal_modes_chosen_this_game
             && self.pending_continuation == other.pending_continuation
             && self.pending_repeat_iteration == other.pending_repeat_iteration
+            && self.pending_change_zone_iteration == other.pending_change_zone_iteration
             && self.pending_repeat_until == other.pending_repeat_until
             && self.pending_choose_one_of == other.pending_choose_one_of
             && self.may_trigger_auto_choices == other.may_trigger_auto_choices

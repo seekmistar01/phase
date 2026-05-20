@@ -339,8 +339,14 @@ pub(super) fn handle_replacement_choice(
             }
 
             if matches!(waiting_for, WaitingFor::Priority { .. })
-                && state.pending_continuation.is_some()
+                && (state.pending_continuation.is_some()
+                    || state.pending_change_zone_iteration.is_some())
             {
+                // CR 614.12b + CR 614.1c + CR 614.13: drain BOTH the chained
+                // continuation and the multi-target ChangeZone iteration that
+                // paused on this replacement choice (issue #535). The drain
+                // helper covers both: it runs the continuation chain (if any)
+                // then the ChangeZone iteration drain hook.
                 effects::drain_pending_continuation(state, events);
                 // CR 616.1e: The continuation may itself pause on another replacement
                 // (e.g., the second direction of fight damage hitting the same shield),

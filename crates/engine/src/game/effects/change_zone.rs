@@ -600,76 +600,50 @@ pub fn resolve(
         return Ok(());
     }
 
-    for obj_id in targeted_objects {
-        // CR 114.5: Emblems cannot be moved between zones
-        if state.objects.get(&obj_id).is_some_and(|o| o.is_emblem) {
-            continue;
-        }
+    let ctx = ChangeZoneIterationCtx {
+        source_id: ability.source_id,
+        controller: ability.controller,
+        origin,
+        destination: dest_zone,
+        enter_transformed: effect_enter_transformed,
+        enter_tapped: effect_enter_tapped,
+        under_your_control,
+        enters_attacking: effect_enters_attacking,
+        enter_with_counters: effect_enter_with_counters,
+        duration: ability.duration.clone(),
+        track_exiled_by_source,
+    };
+    let _ = owner_library; // routing handled by move_to_zone (CR 400.7)
 
-        let from_zone = state
-            .objects
-            .get(&obj_id)
-            .map(|o| o.zone)
-            .unwrap_or(Zone::Battlefield);
-
-        // CR 400.7: An object that moves zones becomes a new object; if an origin
-        // zone is specified and the object is no longer in that zone, the zone
-        // change is impossible — skip this object.
-        // CR 603.7c: A delayed triggered ability's referent is checked against its
-        // expected origin zone (fixed at delayed-trigger creation, CR 603.7a). A
-        // referent that left that zone is, per CR 400.7, a new object the snapshot
-        // does not name, so the delayed return must not move it. (Re-entry into the
-        // same zone is NOT covered — there is no per-zone-visit object identity.)
-        // Prevents delayed triggers from moving objects that have already left
-        // the expected zone (e.g., Warp creature that died before end step).
-        if let Some(expected_origin) = origin {
-            if from_zone != expected_origin {
-                continue;
-            }
-        }
-
-        // CR 400.7: When owner_library is true, route to the object's owner's library.
-        // The actual owner routing is handled by zones::move_to_zone which uses
-        // the object's owner for player-owned zones.
-        let effective_dest = dest_zone;
-        let _ = owner_library; // routing handled by move_to_zone
-
-        // CR 110.2a: When under_your_control is true, pass the controller override
-        // into the zone-move pipeline so replacement effects see the correct controller.
-        let ctrl_override = if under_your_control {
-            Some(ability.controller)
-        } else {
-            None
-        };
-
-        match execute_zone_move(
-            state,
-            obj_id,
-            from_zone,
-            effective_dest,
-            ability.source_id,
-            ability.duration.as_ref(),
-            effect_enter_transformed,
-            effect_enter_tapped,
-            ctrl_override,
-            &effect_enter_with_counters,
-            track_exiled_by_source,
-            events,
-        ) {
-            ZoneMoveResult::Done => {
-                // CR 508.4: Place on battlefield attacking (not declared as attacker).
-                if effect_enters_attacking && effective_dest == Zone::Battlefield {
-                    crate::game::combat::enter_attacking(
-                        state,
-                        obj_id,
-                        ability.source_id,
-                        ability.controller,
-                    );
-                }
-            }
+    for (i, obj_id) in targeted_objects.iter().enumerate() {
+        match process_one_zone_move(state, &ctx, *obj_id, events) {
+            ZoneMoveResult::Done => {}
             ZoneMoveResult::NeedsChoice(player) => {
+                // CR 614.12b + CR 614.1c + CR 614.13: stash the unprocessed targets
+                // so `drain_pending_change_zone_iteration` resumes the loop after
+                // the player resolves this replacement. Without the stash, every
+                // target after the first NeedsChoice would be silently dropped
+                // (issue #535).
+                state.pending_change_zone_iteration =
+                    Some(crate::types::game_state::PendingChangeZoneIteration {
+                        remaining: targeted_objects[i + 1..].to_vec(),
+                        source_id: ctx.source_id,
+                        controller: ctx.controller,
+                        origin: ctx.origin,
+                        destination: ctx.destination,
+                        enter_transformed: ctx.enter_transformed,
+                        enter_tapped: ctx.enter_tapped,
+                        under_your_control: ctx.under_your_control,
+                        enters_attacking: ctx.enters_attacking,
+                        enter_with_counters: ctx.enter_with_counters.clone(),
+                        duration: ctx.duration.clone(),
+                        track_exiled_by_source: ctx.track_exiled_by_source,
+                        effect_kind: EffectKind::from(&ability.effect),
+                    });
                 state.waiting_for =
                     crate::game::replacement::replacement_choice_waiting_for(player, state);
+                // EffectResolved is emitted by the drain after the loop completes —
+                // do NOT emit here.
                 return Ok(());
             }
         }
@@ -681,6 +655,95 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// Per-iteration context for the multi-target `ChangeZone` loop. Captured once
+/// per `resolve` call (and once per `EffectZoneChoice` resolution) so that the
+/// loop body and the post-pause drain share one parameter bundle. Mirrors
+/// the captured fields on [`crate::types::game_state::PendingChangeZoneIteration`]
+/// minus the resume-only fields (`remaining`, `effect_kind`).
+pub(crate) struct ChangeZoneIterationCtx {
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+    pub origin: Option<Zone>,
+    pub destination: Zone,
+    pub enter_transformed: bool,
+    pub enter_tapped: bool,
+    pub under_your_control: bool,
+    pub enters_attacking: bool,
+    pub enter_with_counters: Vec<(CounterType, u32)>,
+    pub duration: Option<Duration>,
+    pub track_exiled_by_source: bool,
+}
+
+/// Move one object through the full zone-change pipeline used by the
+/// multi-target `ChangeZone` resolution loop and the `EffectZoneChoice`
+/// multi-card resume path. Returns `ZoneMoveResult` so the caller can stash
+/// and pause on `NeedsChoice` (issue #535).
+///
+/// Encapsulates: emblem guard (CR 114.5), origin-mismatch skip (CR 400.7 /
+/// CR 603.7c), controller override (CR 110.2a), the pipeline call, and the
+/// `enter_attacking` post-step (CR 508.4).
+pub(crate) fn process_one_zone_move(
+    state: &mut GameState,
+    ctx: &ChangeZoneIterationCtx,
+    obj_id: ObjectId,
+    events: &mut Vec<GameEvent>,
+) -> ZoneMoveResult {
+    // CR 114.5: Emblems cannot be moved between zones.
+    if state.objects.get(&obj_id).is_some_and(|o| o.is_emblem) {
+        return ZoneMoveResult::Done;
+    }
+
+    let from_zone = state
+        .objects
+        .get(&obj_id)
+        .map(|o| o.zone)
+        .unwrap_or(Zone::Battlefield);
+
+    // CR 400.7 + CR 603.7c: If an origin zone is specified and the object is
+    // no longer in that zone, the zone change is impossible — skip silently.
+    if let Some(expected_origin) = ctx.origin {
+        if from_zone != expected_origin {
+            return ZoneMoveResult::Done;
+        }
+    }
+
+    // CR 110.2a: When `under_your_control` is true, pass the controller override
+    // into the zone-move pipeline so replacement effects see the correct controller.
+    let ctrl_override = if ctx.under_your_control {
+        Some(ctx.controller)
+    } else {
+        None
+    };
+
+    let result = execute_zone_move(
+        state,
+        obj_id,
+        from_zone,
+        ctx.destination,
+        ctx.source_id,
+        ctx.duration.as_ref(),
+        ctx.enter_transformed,
+        ctx.enter_tapped,
+        ctrl_override,
+        &ctx.enter_with_counters,
+        ctx.track_exiled_by_source,
+        events,
+    );
+
+    if let ZoneMoveResult::Done = result {
+        // CR 508.4: Place on battlefield attacking (not declared as attacker).
+        if ctx.enters_attacking && ctx.destination == Zone::Battlefield {
+            let controller = state
+                .objects
+                .get(&obj_id)
+                .map(|obj| obj.controller)
+                .unwrap_or(ctx.controller);
+            crate::game::combat::enter_attacking(state, obj_id, ctx.source_id, controller);
+        }
+    }
+    result
 }
 
 /// Move all objects matching the filter from `Origin` zone to `Destination` zone.
@@ -3555,5 +3618,434 @@ mod tests {
             Zone::Battlefield,
             "Exiled creature must return to the battlefield when TrackedSetId(0) is resolved"
         );
+    }
+
+    /// CR 614.12b + CR 614.1c + CR 614.13: when a multi-target ChangeZone
+    /// resolution moves two or more objects to the battlefield simultaneously
+    /// and each has a per-permanent replacement choice (shock-land "pay 2
+    /// life?" prompt), every chosen object must end up in the destination
+    /// zone. Pre-fix, the first NeedsChoice abandoned the remaining iterations
+    /// — only the first card ever entered the battlefield (issue #535).
+    #[test]
+    fn multi_target_change_zone_with_per_target_replacement_choice_processes_all_targets() {
+        use crate::game::engine::apply_as_current;
+        use crate::game::game_object::GameObject;
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, ReplacementDefinition, ReplacementMode,
+        };
+        use crate::types::actions::GameAction;
+        use crate::types::replacements::ReplacementEvent;
+
+        fn add_shock_in_library(state: &mut GameState, id: u64, owner: PlayerId) -> ObjectId {
+            let obj_id = ObjectId(id);
+            let mut obj = GameObject::new(
+                obj_id,
+                CardId(id),
+                owner,
+                format!("Shock {id}"),
+                Zone::Library,
+            );
+            let repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .mode(ReplacementMode::MayCost {
+                    cost: AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 2 },
+                    },
+                    decline: Some(Box::new(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::Tap {
+                            target: TargetFilter::SelfRef,
+                        },
+                    ))),
+                })
+                .valid_card(TargetFilter::SelfRef);
+            obj.replacement_definitions = vec![repl].into();
+            state.objects.insert(obj_id, obj);
+            state
+                .players
+                .iter_mut()
+                .find(|p| p.id == owner)
+                .unwrap()
+                .library
+                .push_back(obj_id);
+            obj_id
+        }
+
+        let mut state = GameState::new_two_player(42);
+        let shock_a = add_shock_in_library(&mut state, 501, PlayerId(0));
+        let shock_b = add_shock_in_library(&mut state, 502, PlayerId(0));
+
+        // Active/priority player drives the choices.
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        let life_before = state.players[0].life;
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                under_your_control: false,
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+            },
+            vec![TargetRef::Object(shock_a), TargetRef::Object(shock_b)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // First NeedsChoice fires for shock_a; the engine must be parked.
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+            "expected first ReplacementChoice, got {:?}",
+            state.waiting_for
+        );
+
+        // Decline (index 1) — first shock enters tapped, no life paid.
+        let _ = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+            .expect("decline first replacement");
+
+        // Discriminator: pre-fix this was Priority because the inner loop returned
+        // after the first NeedsChoice and the second target was abandoned.
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+            "expected a SECOND ReplacementChoice for shock_b, got {:?} — second target was abandoned",
+            state.waiting_for
+        );
+
+        // Decline the second one as well.
+        let _ = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+            .expect("decline second replacement");
+
+        assert_eq!(
+            state.objects[&shock_a].zone,
+            Zone::Battlefield,
+            "shock_a must end up on the battlefield"
+        );
+        assert_eq!(
+            state.objects[&shock_b].zone,
+            Zone::Battlefield,
+            "shock_b must end up on the battlefield (pre-fix this was Library)"
+        );
+        assert!(
+            state.objects[&shock_a].tapped,
+            "shock_a declined → enters tapped"
+        );
+        assert!(
+            state.objects[&shock_b].tapped,
+            "shock_b declined → enters tapped"
+        );
+        assert_eq!(
+            state.players[0].life, life_before,
+            "both declined → no life paid"
+        );
+        assert!(
+            state.pending_change_zone_iteration.is_none(),
+            "resume slot must be cleared once the loop completes"
+        );
+    }
+
+    /// Helper: replicates the shock-land-in-library scaffolding used across
+    /// the resume-loop tests below.
+    #[cfg(test)]
+    fn add_shock_in_library_for_test(state: &mut GameState, id: u64, owner: PlayerId) -> ObjectId {
+        use crate::game::game_object::GameObject;
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, ReplacementDefinition, ReplacementMode,
+        };
+        use crate::types::replacements::ReplacementEvent;
+
+        let obj_id = ObjectId(id);
+        let mut obj = GameObject::new(
+            obj_id,
+            CardId(id),
+            owner,
+            format!("Shock {id}"),
+            Zone::Library,
+        );
+        let repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .mode(ReplacementMode::MayCost {
+                cost: AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                },
+                decline: Some(Box::new(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Tap {
+                        target: TargetFilter::SelfRef,
+                    },
+                ))),
+            })
+            .valid_card(TargetFilter::SelfRef);
+        obj.replacement_definitions = vec![repl].into();
+        state.objects.insert(obj_id, obj);
+        state
+            .players
+            .iter_mut()
+            .find(|p| p.id == owner)
+            .unwrap()
+            .library
+            .push_back(obj_id);
+        obj_id
+    }
+
+    /// CR 614.12b + CR 614.1c: Pay the first shock-land's life cost, decline
+    /// the second. Both lands must end up on the battlefield; the first
+    /// untapped (paid), the second tapped (declined); life dropped by exactly
+    /// 2 (cost of the first only).
+    #[test]
+    fn multi_target_change_zone_paying_first_shock_then_declining_second() {
+        use crate::game::engine::apply_as_current;
+        use crate::types::actions::GameAction;
+
+        let mut state = GameState::new_two_player(42);
+        let shock_a = add_shock_in_library_for_test(&mut state, 601, PlayerId(0));
+        let shock_b = add_shock_in_library_for_test(&mut state, 602, PlayerId(0));
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        let life_before = state.players[0].life;
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                under_your_control: false,
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+            },
+            vec![TargetRef::Object(shock_a), TargetRef::Object(shock_b)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // First shock: pay (index 0).
+        let _ = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+            .expect("pay first shock");
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+            "second shock must prompt after first resolves"
+        );
+        // Second shock: decline (index 1).
+        let _ = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+            .expect("decline second shock");
+
+        assert_eq!(state.objects[&shock_a].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&shock_b].zone, Zone::Battlefield);
+        assert!(!state.objects[&shock_a].tapped, "first paid → untapped");
+        assert!(state.objects[&shock_b].tapped, "second declined → tapped");
+        assert_eq!(
+            state.players[0].life,
+            life_before - 2,
+            "only the first shock's 2 life cost paid"
+        );
+    }
+
+    /// Regression guard: three sequential `ReplacementChoice` pauses must all
+    /// resume. A resume primitive that only fires once would leave the third
+    /// shock stranded.
+    #[test]
+    fn multi_target_change_zone_resume_drives_third_target_with_choice_after_two_chained_pauses() {
+        use crate::game::engine::apply_as_current;
+        use crate::types::actions::GameAction;
+
+        let mut state = GameState::new_two_player(42);
+        let s1 = add_shock_in_library_for_test(&mut state, 701, PlayerId(0));
+        let s2 = add_shock_in_library_for_test(&mut state, 702, PlayerId(0));
+        let s3 = add_shock_in_library_for_test(&mut state, 703, PlayerId(0));
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                under_your_control: false,
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+            },
+            vec![
+                TargetRef::Object(s1),
+                TargetRef::Object(s2),
+                TargetRef::Object(s3),
+            ],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        for _ in 0..3 {
+            assert!(
+                matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+                "expected ReplacementChoice at each iteration"
+            );
+            let _ = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+                .expect("decline shock");
+        }
+
+        for shock in [s1, s2, s3] {
+            assert_eq!(
+                state.objects[&shock].zone,
+                Zone::Battlefield,
+                "shock {:?} must end up on the battlefield",
+                shock
+            );
+            assert!(state.objects[&shock].tapped);
+        }
+        assert!(state.pending_change_zone_iteration.is_none());
+    }
+
+    /// CR 614.12b: covers the parallel fix at
+    /// `engine_resolution_choices.rs::EffectZoneChoice` — the multi-card loop
+    /// for untargeted "put X cards from your hand onto the battlefield"
+    /// patterns must also resume after a per-permanent replacement choice
+    /// pauses the loop.
+    #[test]
+    fn effect_zone_choice_multi_card_with_replacement_choice_processes_all_chosen() {
+        use crate::game::engine::apply_as_current;
+        use crate::types::actions::GameAction;
+
+        let mut state = GameState::new_two_player(42);
+        // Construct two shock-style objects but place them in HAND so that the
+        // EffectZoneChoice code path (which scans eligible cards) is the one
+        // that drives them onto the battlefield.
+        let shock_a = {
+            use crate::game::game_object::GameObject;
+            use crate::types::ability::{
+                AbilityCost, AbilityDefinition, AbilityKind, ReplacementDefinition, ReplacementMode,
+            };
+            use crate::types::replacements::ReplacementEvent;
+            let oid = ObjectId(801);
+            let mut obj = GameObject::new(
+                oid,
+                CardId(801),
+                PlayerId(0),
+                "HandShock A".to_string(),
+                Zone::Hand,
+            );
+            let repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .mode(ReplacementMode::MayCost {
+                    cost: AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 2 },
+                    },
+                    decline: Some(Box::new(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::Tap {
+                            target: TargetFilter::SelfRef,
+                        },
+                    ))),
+                })
+                .valid_card(TargetFilter::SelfRef);
+            obj.replacement_definitions = vec![repl].into();
+            state.objects.insert(oid, obj);
+            state.players[0].hand.push_back(oid);
+            oid
+        };
+        let shock_b = {
+            use crate::game::game_object::GameObject;
+            use crate::types::ability::{
+                AbilityCost, AbilityDefinition, AbilityKind, ReplacementDefinition, ReplacementMode,
+            };
+            use crate::types::replacements::ReplacementEvent;
+            let oid = ObjectId(802);
+            let mut obj = GameObject::new(
+                oid,
+                CardId(802),
+                PlayerId(0),
+                "HandShock B".to_string(),
+                Zone::Hand,
+            );
+            let repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .mode(ReplacementMode::MayCost {
+                    cost: AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 2 },
+                    },
+                    decline: Some(Box::new(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::Tap {
+                            target: TargetFilter::SelfRef,
+                        },
+                    ))),
+                })
+                .valid_card(TargetFilter::SelfRef);
+            obj.replacement_definitions = vec![repl].into();
+            state.objects.insert(oid, obj);
+            state.players[0].hand.push_back(oid);
+            oid
+        };
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        // Park the engine in EffectZoneChoice manually — there is no
+        // canonical card that emits this exact prompt with both shocks
+        // present, so the test drives the resume path directly.
+        state.waiting_for = WaitingFor::EffectZoneChoice {
+            player: PlayerId(0),
+            cards: vec![shock_a, shock_b],
+            count: 2,
+            min_count: 0,
+            up_to: true,
+            source_id: ObjectId(100),
+            effect_kind: EffectKind::ChangeZone,
+            zone: Zone::Hand,
+            destination: Some(Zone::Battlefield),
+            enter_tapped: false,
+            enter_transformed: false,
+            under_your_control: false,
+            enters_attacking: false,
+            owner_library: false,
+            track_exiled_by_source: false,
+            count_param: 0,
+        };
+
+        let _ = apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![shock_a, shock_b],
+            },
+        )
+        .expect("select both cards");
+
+        // First shock prompts; decline it (index 1 → tap).
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+            "first shock should prompt, got {:?}",
+            state.waiting_for
+        );
+        let _ = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+            .expect("decline first hand shock");
+        // Discriminator: second shock must also prompt — pre-fix, the
+        // EffectZoneChoice loop returned after the first NeedsChoice and
+        // shock_b would have stayed in hand.
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+            "second shock must prompt via resume, got {:?}",
+            state.waiting_for
+        );
+        let _ = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+            .expect("decline second hand shock");
+
+        assert_eq!(state.objects[&shock_a].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&shock_b].zone, Zone::Battlefield);
+        assert!(state.pending_change_zone_iteration.is_none());
     }
 }

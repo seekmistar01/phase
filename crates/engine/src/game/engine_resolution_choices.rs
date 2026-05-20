@@ -1392,39 +1392,47 @@ pub(super) fn handle_resolution_choice(
                             "EffectZoneChoice missing destination for zone move".to_string(),
                         )
                     })?;
-                    for &card_id in &chosen {
-                        let controller_override = if under_your_control {
-                            Some(player)
-                        } else {
-                            None
-                        };
-                        match effects::change_zone::execute_zone_move(
-                            state,
-                            card_id,
-                            zone,
-                            dest_zone,
-                            source_id,
-                            None,
-                            enter_transformed,
-                            enter_tapped,
-                            controller_override,
-                            &[],
-                            track_exiled_by_source,
-                            events,
+                    let ctx = effects::change_zone::ChangeZoneIterationCtx {
+                        source_id,
+                        controller: player,
+                        origin: Some(zone),
+                        destination: dest_zone,
+                        enter_transformed,
+                        enter_tapped,
+                        under_your_control,
+                        enters_attacking,
+                        enter_with_counters: vec![],
+                        duration: None,
+                        track_exiled_by_source,
+                    };
+                    let chosen_ids: Vec<_> = chosen.to_vec();
+                    for (i, card_id) in chosen_ids.iter().enumerate() {
+                        match effects::change_zone::process_one_zone_move(
+                            state, &ctx, *card_id, events,
                         ) {
-                            effects::change_zone::ZoneMoveResult::Done => {
-                                if enters_attacking && dest_zone == Zone::Battlefield {
-                                    let controller = state
-                                        .objects
-                                        .get(&card_id)
-                                        .map(|obj| obj.controller)
-                                        .unwrap_or(player);
-                                    super::combat::enter_attacking(
-                                        state, card_id, source_id, controller,
-                                    );
-                                }
-                            }
+                            effects::change_zone::ZoneMoveResult::Done => {}
                             effects::change_zone::ZoneMoveResult::NeedsChoice(choice_player) => {
+                                // CR 614.12b + CR 614.1c + CR 614.13: stash the
+                                // unprocessed cards so the drain in
+                                // `effects/mod.rs::drain_pending_change_zone_iteration`
+                                // resumes the loop after this replacement
+                                // choice resolves (issue #535).
+                                state.pending_change_zone_iteration =
+                                    Some(crate::types::game_state::PendingChangeZoneIteration {
+                                        remaining: chosen_ids[i + 1..].to_vec(),
+                                        source_id: ctx.source_id,
+                                        controller: ctx.controller,
+                                        origin: ctx.origin,
+                                        destination: ctx.destination,
+                                        enter_transformed: ctx.enter_transformed,
+                                        enter_tapped: ctx.enter_tapped,
+                                        under_your_control: ctx.under_your_control,
+                                        enters_attacking: ctx.enters_attacking,
+                                        enter_with_counters: ctx.enter_with_counters.clone(),
+                                        duration: ctx.duration.clone(),
+                                        track_exiled_by_source: ctx.track_exiled_by_source,
+                                        effect_kind,
+                                    });
                                 state.waiting_for =
                                     super::replacement::replacement_choice_waiting_for(
                                         choice_player,
