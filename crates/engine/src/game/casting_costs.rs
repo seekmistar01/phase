@@ -4100,7 +4100,7 @@ mod tests {
     };
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::CardId;
-    use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
+    use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
     use crate::types::statics::StaticMode;
 
     fn make_pending(source_id: ObjectId) -> PendingCast {
@@ -4133,6 +4133,98 @@ mod tests {
             convoked_creatures: Vec::new(),
             payment_mode: CastPaymentMode::Auto,
         }
+    }
+
+    #[test]
+    fn manual_payment_mode_pauses_unambiguous_spell_cost() {
+        let mut state = GameState::new_two_player(42);
+        let caster = PlayerId(0);
+        let spell = create_object(
+            &mut state,
+            CardId(100),
+            caster,
+            "Manual Payment Spell".to_string(),
+            Zone::Hand,
+        );
+        state.objects.get_mut(&spell).unwrap().card_types.core_types = vec![CoreType::Instant];
+        state.players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(900),
+            false,
+            Vec::new(),
+        ));
+        crate::game::stack::push_to_stack(
+            &mut state,
+            StackEntry {
+                id: spell,
+                source_id: spell,
+                controller: caster,
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(100),
+                    ability: None,
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            },
+            &mut Vec::new(),
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            spell,
+            caster,
+        );
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        };
+        let mut events = Vec::new();
+
+        let waiting = pay_and_push_adventure(
+            &mut state,
+            caster,
+            spell,
+            CardId(100),
+            ability,
+            &cost,
+            CastingVariant::Normal,
+            None,
+            None,
+            Zone::Hand,
+            CastPaymentMode::Manual,
+            &mut events,
+        )
+        .expect("manual payment should pause before paying mana");
+
+        assert!(matches!(
+            waiting,
+            WaitingFor::ManaPayment {
+                player,
+                convoke_mode: None,
+            } if player == caster
+        ));
+        let pending = state
+            .pending_cast
+            .as_ref()
+            .expect("manual payment should preserve pending cast");
+        assert_eq!(pending.payment_mode, CastPaymentMode::Manual);
+        assert_eq!(pending.cost, cost);
+        assert_eq!(state.players[0].mana_pool.total(), 1);
+        assert!(state.stack.iter().any(|entry| {
+            entry.id == spell
+                && matches!(
+                    entry.kind,
+                    StackEntryKind::Spell {
+                        ability: None,
+                        actual_mana_spent: 0,
+                        ..
+                    }
+                )
+        }));
     }
 
     #[test]
