@@ -1,4 +1,5 @@
 mod admin;
+mod draft_pools;
 mod logging;
 mod persistence;
 
@@ -45,6 +46,7 @@ type SharedLobbySubscribers = Arc<Mutex<Vec<mpsc::UnboundedSender<ServerMessage>
 type SharedPlayerCount = Arc<AtomicU32>;
 type SharedGameDb = Arc<persistence::GameDb>;
 type SharedDraftState = Arc<Mutex<DraftSessionManager>>;
+type SharedDraftPools = Arc<draft_pools::DraftPools>;
 /// Spectator senders keyed by draft_code. Each spectator has a visibility + sender.
 type SharedDraftSpectators = Arc<
     Mutex<
@@ -360,6 +362,22 @@ async fn main() {
 
     let state: SharedState = Arc::new(Mutex::new(SessionManager::new()));
     let draft_sessions: SharedDraftState = Arc::new(Mutex::new(DraftSessionManager::new()));
+    let draft_pools_path = data_path.join("draft-pools.json");
+    let draft_pools: SharedDraftPools = match draft_pools::DraftPools::from_path(&draft_pools_path)
+    {
+        Ok(pools) => {
+            info!(sets = pools.len(), "draft pools loaded");
+            Arc::new(pools)
+        }
+        Err(e) => {
+            warn!(
+                path = %draft_pools_path.display(),
+                error = %e,
+                "draft pools unavailable; server-hosted drafts cannot start"
+            );
+            Arc::new(draft_pools::DraftPools::default())
+        }
+    };
     let connections: SharedConnections = Arc::new(Mutex::new(HashMap::new()));
     let draft_spectators: SharedDraftSpectators = Arc::new(Mutex::new(HashMap::new()));
     let lobby: SharedLobby = Arc::new(Mutex::new(LobbyManager::new()));
@@ -639,6 +657,7 @@ async fn main() {
         .with_state(AppState {
             sessions: state,
             draft_sessions,
+            draft_pools,
             connections,
             db,
             lobby,
@@ -735,6 +754,7 @@ async fn health() -> &'static str {
 struct AppState {
     sessions: SharedState,
     draft_sessions: SharedDraftState,
+    draft_pools: SharedDraftPools,
     connections: SharedConnections,
     db: SharedDb,
     lobby: SharedLobby,
@@ -762,6 +782,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(app_state): State<AppState>) -> 
                 socket,
                 app_state.sessions,
                 app_state.draft_sessions,
+                app_state.draft_pools,
                 app_state.connections,
                 app_state.db,
                 app_state.lobby,
@@ -780,6 +801,7 @@ async fn handle_socket(
     mut socket: WebSocket,
     state: SharedState,
     draft_state: SharedDraftState,
+    draft_pools: SharedDraftPools,
     connections: SharedConnections,
     db: SharedDb,
     lobby: SharedLobby,
@@ -875,6 +897,7 @@ async fn handle_socket(
                             &mut socket,
                             &state,
                             &draft_state,
+                            &draft_pools,
                             &connections,
                             &db,
                             &lobby,
@@ -1444,12 +1467,32 @@ async fn require_host(identity: &SocketIdentity, socket: &mut WebSocket) -> Resu
     Ok(())
 }
 
+async fn draft_pack_generator_for_start(
+    draft_state: &SharedDraftState,
+    draft_pools: &SharedDraftPools,
+    draft_code: &str,
+) -> Result<draft_core::pack_generator::PackGenerator, String> {
+    let set_code = {
+        let mgr = draft_state.lock().await;
+        let session = mgr
+            .sessions
+            .get(draft_code)
+            .ok_or_else(|| format!("Draft not found: {draft_code}"))?;
+        session.config.set_code.clone()
+    };
+
+    draft_pools
+        .generator_for_set(&set_code)
+        .ok_or_else(|| format!("No draft pool data for set: {set_code}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     client_msg: ClientMessage,
     socket: &mut WebSocket,
     state: &SharedState,
     draft_state: &SharedDraftState,
+    draft_pools: &SharedDraftPools,
     connections: &SharedConnections,
     db: &SharedDb,
     lobby: &SharedLobby,
@@ -3312,6 +3355,16 @@ async fn handle_client_message(
                 "CreateDraftWithSettings"
             );
 
+            if !draft_pools.contains_set(&set_code) {
+                let msg = ServerMessage::DraftActionRejected {
+                    reason: format!("No draft pool data for set: {set_code}"),
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = socket.send(Message::text(json)).await;
+                }
+                return;
+            }
+
             let config = draft_core::types::DraftConfig {
                 source: draft_core::types::DraftSource::Set {
                     code: set_code.clone(),
@@ -3489,10 +3542,31 @@ async fn handle_client_message(
 
             // Check if this is a StartDraft action (triggers timer)
             let is_start = matches!(action, draft_core::types::DraftAction::StartDraft);
+            let pack_generator = if is_start {
+                match draft_pack_generator_for_start(draft_state, draft_pools, &draft_code).await {
+                    Ok(generator) => Some(generator),
+                    Err(reason) => {
+                        let msg = ServerMessage::DraftActionRejected { reason };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            let _ = socket.send(Message::text(json)).await;
+                        }
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
 
             let result = {
                 let mut mgr = draft_state.lock().await;
-                mgr.handle_draft_action(&draft_code, &token, action, None)
+                mgr.handle_draft_action(
+                    &draft_code,
+                    &token,
+                    action,
+                    pack_generator
+                        .as_ref()
+                        .map(|generator| generator as &dyn draft_core::pack_source::PackSource),
+                )
             };
 
             match result {

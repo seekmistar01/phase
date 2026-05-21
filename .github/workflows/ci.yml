@@ -229,14 +229,15 @@ jobs:
 
       - name: Stub phase-server sidecar + bundled resources for tauri-build
         # tauri.conf.json declares `externalBin: ["binaries/phase-server"]`
-        # and `resources: { "../public/card-data.json": ... }`, so
-        # tauri-build requires both paths to exist at check time. The real
-        # sidecar / card-data are built in the release matrix; for PR-time
-        # compile checks we only need the paths to exist.
+        # and bundled data resources, so tauri-build requires those paths to
+        # exist at check time. The real sidecar / data files are built in the
+        # release matrix; for PR-time compile checks we only need the paths to
+        # exist.
         run: |
           mkdir -p client/src-tauri/binaries client/public
           touch client/src-tauri/binaries/phase-server-x86_64-unknown-linux-gnu
           touch client/public/card-data.json
+          touch client/public/draft-pools.json
 
       - name: Tauri compile check
         # phase-tauri is excluded from the workspace clippy and nextest runs

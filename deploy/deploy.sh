@@ -35,6 +35,7 @@ sudo cp "${TMP_DIR}/phase-server" "${INSTALL_DIR}/phase-server"
 sudo chmod +x "${INSTALL_DIR}/phase-server"
 sudo mkdir -p "${INSTALL_DIR}/data"
 sudo cp "${TMP_DIR}/data/card-data.json" "${INSTALL_DIR}/data/card-data.json"
+sudo cp "${TMP_DIR}/data/draft-pools.json" "${INSTALL_DIR}/data/draft-pools.json"
 sudo chown -R phase:phase "${INSTALL_DIR}"
 
 echo "Starting ${SERVICE}..."
