@@ -639,6 +639,14 @@ export interface GameObject {
   casting_permissions?: CastingPermission[];
   is_emblem?: boolean;
   /**
+   * CR 111.1: Whether this object is a token (not a card). Independent of
+   * `display_source`: a token-copy of a real card (Twinflame, Helm of the
+   * Host) carries `is_token = true` AND `display_source = "Card"`, so it
+   * renders visually identical to the printed card. Combine the two to flag
+   * such copies (`is_token && display_source !== "Token"`).
+   */
+  is_token?: boolean;
+  /**
    * Image-lookup routing hint from the engine. "Card" → look up the image
    * in the real-card database (default; also covers token-copies of real
    * cards like Twinflame/Helm of the Host). "Token" → look up the image
