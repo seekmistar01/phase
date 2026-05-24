@@ -1883,14 +1883,33 @@ pub enum FilterProp {
     HasColor {
         color: ManaColor,
     },
-    /// Matches objects with power <= N (for "creature with power 2 or less").
-    /// CR 208.1: Uses QuantityExpr to support both fixed and dynamic comparisons.
-    PowerLE {
-        value: QuantityExpr,
-    },
-    /// Matches objects with power >= N (for "creature with power 3 or greater").
-    /// CR 208.1: Uses QuantityExpr to support both fixed and dynamic comparisons.
-    PowerGE {
+    /// CR 208 (Power/Toughness) + CR 208.4b (base vs current) + CR 613.4b
+    /// (layer 7b: base P/T is set before counters/modifiers in 7c): Matches
+    /// objects whose power or toughness satisfies `comparator` against `value`.
+    ///
+    /// Replaces the former `PowerLE`/`PowerGE`/`ToughnessLE`/`ToughnessGE`
+    /// sibling cluster (a `stat × comparator` cross-product) with a single
+    /// parameterized predicate, mirroring the `Cmc` and `Counters` refactors.
+    /// Three orthogonal axes:
+    /// - `stat`: which characteristic to read — power (CR 208.1) or toughness.
+    /// - `scope`: `Current` reads the live `power`/`toughness` (after all layers);
+    ///   `Base` reads `base_power`/`base_toughness` per CR 208.4b — the value
+    ///   after CDAs and set effects (layers 7a/7b) but ignoring counters and
+    ///   modifying effects (layer 7c). A 1/1 with a +1/+1 counter has base
+    ///   power 1 but current power 2.
+    /// - `comparator`: any `Comparator` (LE/GE/EQ/LT/GT/NE).
+    ///
+    /// The disjunctive natural-language form "power or toughness N or less"
+    /// composes two `PtComparison` props under `AnyOf`.
+    ///
+    /// Card data is regenerated from Oracle text at build time, so no legacy-tag
+    /// deserialization shim is required; `scope` defaults to `Current` when
+    /// absent for forward-compatible hand-authored fixtures.
+    PtComparison {
+        stat: PtStat,
+        #[serde(default)]
+        scope: PtValueScope,
+        comparator: Comparator,
         value: QuantityExpr,
     },
     /// CR 509.1b: Matches objects whose power is strictly greater than the source object's power.
@@ -1958,20 +1977,10 @@ pub enum FilterProp {
     Suspected,
     /// CR 510.1c: Matches creatures whose toughness is greater than their power.
     ToughnessGTPower,
-    /// CR 208.1: Matches objects with toughness <= N. Mirrors `PowerLE`.
-    /// Used for "creature with toughness N or less" and as a building block
-    /// for disjunctive P/T filters ("power or toughness N or less").
-    ToughnessLE {
-        value: QuantityExpr,
-    },
-    /// CR 208.1: Matches objects with toughness >= N. Mirrors `PowerGE`.
-    ToughnessGE {
-        value: QuantityExpr,
-    },
     /// Disjunctive composite: the object matches if ANY inner prop matches.
     /// Used for natural-language OR within a property suffix — e.g.
     /// "creature with power or toughness N or less" decomposes to
-    /// `AnyOf { [PowerLE(N), ToughnessLE(N)] }` on a `creature` typed filter,
+    /// `AnyOf { [PtComparison(Power,LE,N), PtComparison(Toughness,LE,N)] }` on a `creature` typed filter,
     /// preserving the single-type constraint while expressing the OR
     /// semantics at the property layer. Nest by composing with other props.
     AnyOf {
@@ -3387,6 +3396,33 @@ impl Comparator {
             Comparator::NE => Comparator::EQ,
         }
     }
+}
+
+/// CR 208: Selects which creature characteristic a `FilterProp::PtComparison`
+/// reads. Power and toughness are both defined in CR 208 (Power/Toughness) and
+/// are read identically by a filter — only the field differs — so they are a
+/// leaf-level parameterization axis, not a cross-section conflation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PtStat {
+    /// CR 208.1: The creature's power (first number).
+    Power,
+    /// CR 208.1: The creature's toughness (second number).
+    Toughness,
+}
+
+/// CR 208.4b: Selects whether a `FilterProp::PtComparison` reads the creature's
+/// current power/toughness (after all continuous effects) or its base
+/// power/toughness. Per CR 613.4b, base values are those set in layer 7b (after
+/// CDAs in 7a and set effects, but before counters and modifying effects in
+/// 7c). A 1/1 with a +1/+1 counter has base power 1 but current power 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PtValueScope {
+    /// CR 613.4: The fully-modified value after applying every layer-7 sublayer.
+    #[default]
+    Current,
+    /// CR 208.4b: The value after layer 7b only — ignores counters (7c) and
+    /// other modifying effects.
+    Base,
 }
 
 /// CR 719.1: Condition that must be met for a Case to become solved.
