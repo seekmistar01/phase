@@ -7492,6 +7492,38 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         return Some((TriggerMode::DamageReceived, def));
     }
 
+    // CR 701.30b-c: "whenever you clash" fires when the controller of the
+    // trigger source is either player participating in a clash.
+    // Cards: Entangling Trap, Rebellion of the Flamekin.
+    if all_consuming(preceded(
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        value((), (tag("you"), space1, tag("clash"))),
+    ))
+    .parse(lower)
+    .is_ok()
+    {
+        let mut def = make_base();
+        def.mode = TriggerMode::Clashed;
+        def.valid_target = Some(TargetFilter::Controller);
+        return Some((TriggerMode::Clashed, def));
+    }
+
+    // CR 701.30: "whenever a player clashes" — fires for any clashing player.
+    if all_consuming(preceded(
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        value(
+            (),
+            (tag("a"), space1, tag("player"), space1, tag("clashes")),
+        ),
+    ))
+    .parse(lower)
+    .is_ok()
+    {
+        let mut def = make_base();
+        def.mode = TriggerMode::Clashed;
+        return Some((TriggerMode::Clashed, def));
+    }
+
     None
 }
 
@@ -20539,6 +20571,8 @@ mod tests {
 /// `parse_trigger_line_with_index_ir` / `lower_trigger_ir` refactor.
 #[cfg(test)]
 mod snapshot_tests {
+    use crate::types::ability::AbilityCondition;
+
     use super::*;
 
     fn parse_trigger_line(text: &str, card_name: &str) -> TriggerDefinition {
@@ -20898,6 +20932,56 @@ mod snapshot_tests {
         );
         assert_eq!(def.mode, TriggerMode::Exerted);
         assert!(def.valid_card.is_some());
+    }
+
+    /// CR 701.30b-c: "Whenever you clash" scopes to the trigger controller as
+    /// either player participating in the clash.
+    /// Cards: Entangling Trap, Rebellion of the Flamekin.
+    #[test]
+    fn trigger_you_clash_whenever() {
+        let def = parse_trigger_line(
+            "Whenever you clash, tap target creature an opponent controls. If you won, that creature doesn't untap during its controller's next untap step.",
+            "Entangling Trap",
+        );
+        assert_eq!(def.mode, TriggerMode::Clashed);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        let Some(execute) = def.execute.as_deref() else {
+            panic!("expected trigger body");
+        };
+        let Some(tail) = execute.sub_ability.as_deref() else {
+            panic!("expected if-you-won tail");
+        };
+        assert_eq!(tail.condition, Some(AbilityCondition::EventOutcomeWon));
+    }
+
+    /// CR 701.30b-c: "When you clash" accepts the alternate trigger prefix.
+    #[test]
+    fn trigger_you_clash_when_prefix() {
+        let def = parse_trigger_line(
+            "When you clash, you may pay {1}. If you do, create a 3/1 red Elemental Shaman creature token. If you won, that token gains haste until end of turn.",
+            "Rebellion of the Flamekin",
+        );
+        assert_eq!(def.mode, TriggerMode::Clashed);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        let Some(pay_cost) = def.execute.as_deref() else {
+            panic!("expected trigger body");
+        };
+        let Some(token) = pay_cost.sub_ability.as_deref() else {
+            panic!("expected if-you-do token tail");
+        };
+        assert_eq!(token.condition, Some(AbilityCondition::IfYouDo));
+        let Some(haste) = token.sub_ability.as_deref() else {
+            panic!("expected if-you-won haste tail");
+        };
+        assert_eq!(haste.condition, Some(AbilityCondition::EventOutcomeWon));
+    }
+
+    /// CR 701.30b-c: "Whenever a player clashes" is not scoped to a specific player.
+    #[test]
+    fn trigger_a_player_clashes() {
+        let def = parse_trigger_line("Whenever a player clashes, draw a card.", "Clash Watcher");
+        assert_eq!(def.mode, TriggerMode::Clashed);
+        assert_eq!(def.valid_target, None);
     }
 
     /// CR 602.1 + CR 605.1a: Passive form — "whenever an ability of equipped creature
