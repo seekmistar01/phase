@@ -1754,4 +1754,78 @@ mod tests {
         assert_eq!(&library[..2], &[c, a]);
         assert!(!library[2..].contains(&b) || library.last() == Some(&b));
     }
+
+    /// A Dig reorder-mode selection (keep all, library-destined, reordered) is a
+    /// non-canonical permutation that the candidate enumerator does not list, so
+    /// pre-fix the server rejected it as "Illegal action". The server must now
+    /// bypass the gate for DigChoice and let `apply()` validate it structurally.
+    #[test]
+    fn reordered_dig_selection_is_accepted_not_rejected_as_illegal() {
+        use engine::game::zones::create_object;
+        use engine::types::identifiers::{CardId, ObjectId};
+        use engine::types::zones::Zone;
+
+        let mut mgr = SessionManager::new();
+        let (code, token0) = mgr.create_game(make_deck());
+        let (token1, _) = mgr.join_game(&code, make_deck()).unwrap();
+
+        let session = mgr.sessions.get_mut(&code).unwrap();
+        let dig_player = PlayerId(if session.state.active_player == PlayerId(0) {
+            1
+        } else {
+            0
+        });
+        let token = if dig_player == PlayerId(0) {
+            &token0
+        } else {
+            &token1
+        };
+
+        let mut top_three = Vec::new();
+        for i in 0..3 {
+            let id = create_object(
+                &mut session.state,
+                CardId(2000 + i),
+                dig_player,
+                format!("Dig Card {i}"),
+                Zone::Library,
+            );
+            top_three.push(id);
+        }
+        let (a, b, c): (ObjectId, ObjectId, ObjectId) = (top_three[0], top_three[1], top_three[2]);
+        // Reorder mode: keep all three, library-destined — order matters.
+        session.state.waiting_for = WaitingFor::DigChoice {
+            player: dig_player,
+            library_owner: dig_player,
+            cards: top_three.clone(),
+            keep_count: 3,
+            up_to: false,
+            selectable_cards: top_three.clone(),
+            kept_destination: Some(Zone::Library),
+            rest_destination: Some(Zone::Library),
+            source_id: None,
+        };
+
+        // Non-canonical permutation [c, a, b] — not an enumerated candidate.
+        let token = token.to_string();
+        let result = mgr.handle_action(
+            &code,
+            &token,
+            GameAction::SelectCards {
+                cards: vec![c, a, b],
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "reordered dig selection should be accepted, got: {result:?}"
+        );
+
+        let session = mgr.sessions.get(&code).unwrap();
+        let library: Vec<ObjectId> = session.state.players[dig_player.0 as usize]
+            .library
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(&library[..3], &[c, a, b]);
+    }
 }
