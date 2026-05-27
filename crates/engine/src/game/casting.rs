@@ -8177,14 +8177,14 @@ mod tests {
     use crate::parser::oracle_effect::parse_effect_chain;
     use crate::parser::oracle_static::parse_static_line;
     use crate::types::ability::{
-        AbilityCost, AbilityTag, ActivationRestriction, BasicLandType, CastPermissionConstraint,
-        CastVariantPaid, CastingPermission, ChosenAttribute, ChosenSubtypeKind, Comparator,
-        ContinuousModification, ControllerRef, CostCategory, FilterProp, GainLifePlayer,
-        GameRestriction, KickerVariant, ManaContribution, ManaProduction, ManaSpendPermission,
-        ManaSpendRestriction, ModalSelectionCondition, ModalSelectionConstraint,
-        ProhibitedActivity, QuantityExpr, QuantityRef, RestrictionExpiry, RestrictionPlayerScope,
-        SearchSelectionConstraint, StaticCondition, StaticDefinition, TargetFilter, TypeFilter,
-        TypedFilter,
+        AbilityCost, AbilityTag, ActivationRestriction, AggregateFunction, BasicLandType,
+        CastPermissionConstraint, CastVariantPaid, CastingPermission, ChosenAttribute,
+        ChosenSubtypeKind, Comparator, ContinuousModification, ControllerRef, CostCategory,
+        FilterProp, GainLifePlayer, GameRestriction, KickerVariant, ManaContribution,
+        ManaProduction, ManaSpendPermission, ManaSpendRestriction, ModalSelectionCondition,
+        ModalSelectionConstraint, ObjectProperty, ProhibitedActivity, QuantityExpr, QuantityRef,
+        RestrictionExpiry, RestrictionPlayerScope, SearchSelectionConstraint, StaticCondition,
+        StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::{CoreType, Supertype};
@@ -11874,7 +11874,7 @@ mod tests {
     /// CR 117.7 + CR 601.2f: A self-spell cost reduction printed on the card itself
     /// ("This spell costs {1} less to cast for each instant and sorcery card in your
     /// graveyard.") must fire while the card is in hand. Verifies the parser-emitted
-    /// static (affected = SelfRef, active_zones = [Hand, Stack]) is picked up by the
+    /// static (affected = SelfRef, active_zones = [Hand, Stack, Command]) is picked up by the
     /// casting-time scanner and reduces the spell's generic cost.
     #[test]
     fn tolarian_terror_self_cost_reduction_applies_from_hand() {
@@ -11896,7 +11896,7 @@ mod tests {
                 generic: 6,
             };
             // Self-spell cost reduction as the parser emits it: 1 generic per qualifying
-            // card in the graveyard, affected = SelfRef, active in Hand/Stack.
+            // card in the graveyard, affected = SelfRef, active in Hand/Stack/Command.
             use crate::types::ability::{CountScope, QuantityRef, ZoneRef};
             let mut def = StaticDefinition::new(StaticMode::ReduceCost {
                 amount: ManaCost::generic(1),
@@ -11908,7 +11908,7 @@ mod tests {
                 }),
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack];
+            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
             obj.static_definitions.push(def);
         }
 
@@ -11948,6 +11948,77 @@ mod tests {
                 generic, 3,
                 "3 qualifying graveyard cards should reduce generic from 6 to 3, got {generic}"
             ),
+            other => panic!("expected ManaCost::Cost, got {other:?}"),
+        }
+    }
+
+    /// CR 903.8 + CR 601.2f: A commander cast from the command zone still uses
+    /// self-spell cost modifications printed on that card. Ghalta's "This
+    /// spell costs {X} less..." must therefore function from Command as well
+    /// as Hand/Stack.
+    #[test]
+    fn self_cost_reduction_applies_from_command_zone() {
+        use crate::types::statics::StaticMode;
+
+        let mut state = setup_game_at_main_phase();
+        let ghalta = create_object(
+            &mut state,
+            CardId(991),
+            PlayerId(0),
+            "Ghalta, Primal Hunger".to_string(),
+            Zone::Command,
+        );
+        {
+            let obj = state.objects.get_mut(&ghalta).unwrap();
+            obj.is_commander = true;
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Green, ManaCostShard::Green],
+                generic: 10,
+            };
+            let mut def = StaticDefinition::new(StaticMode::ReduceCost {
+                amount: ManaCost::generic(1),
+                spell_filter: None,
+                dynamic_count: Some(QuantityRef::Aggregate {
+                    function: AggregateFunction::Sum,
+                    property: ObjectProperty::Power,
+                    filter: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::You),
+                    ),
+                }),
+            })
+            .affected(TargetFilter::SelfRef);
+            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+            obj.static_definitions.push(def);
+        }
+
+        let creature = create_object(
+            &mut state,
+            CardId(992),
+            PlayerId(0),
+            "Charging Baloth".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(5);
+            obj.power = Some(5);
+        }
+
+        let mut mana_cost = state.objects.get(&ghalta).unwrap().mana_cost.clone();
+        super::super::casting::apply_self_spell_cost_modifiers(
+            &state,
+            PlayerId(0),
+            ghalta,
+            &mut mana_cost,
+        );
+
+        match mana_cost {
+            ManaCost::Cost { generic, shards } => {
+                assert_eq!(generic, 5);
+                assert_eq!(shards, vec![ManaCostShard::Green, ManaCostShard::Green]);
+            }
             other => panic!("expected ManaCost::Cost, got {other:?}"),
         }
     }
@@ -12275,7 +12346,7 @@ mod tests {
                 dynamic_count: None,
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack];
+            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
             obj.static_definitions.push(def);
         }
 
@@ -22447,10 +22518,10 @@ mod tests {
         use crate::types::mana::ManaCost;
         use crate::types::statics::StaticMode;
 
-        /// Attach a fixed self-spell `ReduceCost` static (active in Hand) to a
-        /// hand card. With `affected = SelfRef` and `dynamic_count = None`, this
-        /// reduces the generic component of whatever base cost is being computed
-        /// — printed OR alternative — mirroring a flat cost reduction.
+        /// Attach a fixed self-spell `ReduceCost` static to a hand card. With
+        /// `affected = SelfRef` and `dynamic_count = None`, this reduces the
+        /// generic component of whatever base cost is being computed — printed
+        /// OR alternative — mirroring a flat cost reduction.
         fn add_self_cost_reduction(state: &mut GameState, obj_id: ObjectId, generic: u32) {
             let obj = state.objects.get_mut(&obj_id).unwrap();
             let mut def = StaticDefinition::new(StaticMode::ReduceCost {
@@ -22459,7 +22530,7 @@ mod tests {
                 dynamic_count: None,
             })
             .affected(TargetFilter::SelfRef);
-            def.active_zones = vec![Zone::Hand, Zone::Stack];
+            def.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
             obj.static_definitions.push(def);
         }
 

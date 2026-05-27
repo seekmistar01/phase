@@ -9981,7 +9981,7 @@ fn first_qualified_spell_condition(filter: &TargetFilter) -> StaticCondition {
 /// a spell reduces/raises its own cast cost (e.g., Tolarian Terror:
 /// "This spell costs {1} less to cast for each instant and sorcery card in
 /// your graveyard."). Callers use this to flag self-reference so the static
-/// is emitted with `affected = SelfRef` and `active_zones = [Hand, Stack]`
+/// is emitted with `affected = SelfRef` and `active_zones = [Hand, Stack, Command]`
 /// instead of the default battlefield scope.
 fn parse_self_spell_cost_subject(lower: &str) -> Option<()> {
     nom_on_lower(lower, lower, |i| {
@@ -10170,7 +10170,7 @@ fn try_parse_cost_floor(text: &str, lower: &str) -> Option<StaticDefinition> {
 /// 3. Global taxing: "Noncreature spells cost {1} more to cast" (Thalia)
 /// 4. Broad: "Spells you cast cost {1} less to cast"
 /// 5. Self-spell: "This spell costs {N} less to cast for each ..." (Tolarian Terror)
-///    — emitted with `affected = SelfRef`, `active_zones = [Hand, Stack]`.
+///    — emitted with `affected = SelfRef`, `active_zones = [Hand, Stack, Command]`.
 ///
 /// Dynamic "for each" counts are extracted when present.
 fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefinition> {
@@ -10186,8 +10186,10 @@ fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefiniti
     // Distinct from battlefield cost modification (e.g., "creature spells you cast cost {1} less")
     // because the static must apply to the card while it is in hand (or on the stack during
     // casting), not once it has entered the battlefield. The caller wires this into
-    // `active_zones = [Hand, Stack]` with `affected = SelfRef` so the casting-time scanner
-    // finds it on the spell being cast.
+    // `active_zones = [Hand, Stack, Command]` with `affected = SelfRef` so
+    // the casting-time scanner finds it on the spell being cast from normal
+    // hand casting, the cost-determination stack step, and commander casting
+    // from the command zone.
     let is_self_spell = parse_self_spell_cost_subject(lower).is_some();
 
     let amount_is_variable_x = nom_primitives::scan_contains(lower, "{x}");
@@ -10464,12 +10466,13 @@ fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefiniti
         .description(text.to_string());
 
     // CR 117.7 + CR 601.2f: A self-spell cost reduction must apply while the
-    // card is in hand (pre-cast affordability checks) and on the stack (final
-    // cost determination during casting). Without opting in via `active_zones`,
-    // layer collection would ignore the static outside the battlefield, and
-    // the card would never reduce its own cost.
+    // card is in hand (pre-cast affordability checks), in the command zone
+    // (commander casting), and on the stack (final cost determination during
+    // casting). Without opting in via `active_zones`, layer collection would
+    // ignore the static outside the battlefield, and the card would never
+    // reduce its own cost.
     if is_self_spell {
-        definition.active_zones = vec![Zone::Hand, Zone::Stack];
+        definition.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
     }
     if let Some(filter) = first_qualified_spell_filter.as_ref() {
         definition.condition = Some(first_qualified_spell_condition(filter));
@@ -11056,8 +11059,9 @@ fn try_parse_scoped_must_attack_block(lower: &str, text: &str) -> Option<Vec<Sta
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AggregateFunction, CardTypeSetSource, CountScope, Duration, Effect, PlayerScope, PtStat,
-        PtValueScope, SharedQuality, SharedQualityRelation, TypeFilter, ZoneRef,
+        AggregateFunction, CardTypeSetSource, CountScope, Duration, Effect, ObjectProperty,
+        PlayerScope, PtStat, PtValueScope, SharedQuality, SharedQualityRelation, TypeFilter,
+        ZoneRef,
     };
 
     /// CR 702.16 + CR 609.6: Serra's Emissary's compound-subject keyword grant
@@ -11594,11 +11598,11 @@ mod tests {
     }
 
     /// CR 117.7 + CR 601.2f: "This spell costs {N} less ..." must parse into a
-    /// self-scoped static — affected = SelfRef, active_zones = [Hand, Stack] —
+    /// self-scoped static — affected = SelfRef, active_zones = [Hand, Stack, Command] —
     /// so the cast-time scanner finds it on the spell itself (not on the
     /// battlefield). Regression guard for Tolarian Terror class.
     #[test]
-    fn static_this_spell_cost_less_self_scoped_in_hand_and_stack() {
+    fn static_this_spell_cost_less_self_scoped_in_castable_zones() {
         let def = parse_static_line(
             "This spell costs {1} less to cast for each instant and sorcery card in your graveyard.",
         )
@@ -11612,7 +11616,36 @@ mod tests {
             }
         ));
         assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
-        assert_eq!(def.active_zones, vec![Zone::Hand, Zone::Stack]);
+        assert_eq!(
+            def.active_zones,
+            vec![Zone::Hand, Zone::Stack, Zone::Command]
+        );
+    }
+
+    #[test]
+    fn ghalta_self_cost_reduction_is_active_from_command_zone() {
+        let def = parse_static_line(
+            "This spell costs {X} less to cast, where X is the total power of creatures you control.",
+        )
+        .unwrap();
+
+        let StaticMode::ReduceCost {
+            dynamic_count:
+                Some(QuantityRef::Aggregate {
+                    function: AggregateFunction::Sum,
+                    property: ObjectProperty::Power,
+                    ..
+                }),
+            ..
+        } = def.mode
+        else {
+            panic!("expected dynamic self-spell ReduceCost, got {:?}", def.mode);
+        };
+        assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+        assert_eq!(
+            def.active_zones,
+            vec![Zone::Hand, Zone::Stack, Zone::Command]
+        );
     }
 
     #[test]
@@ -11642,7 +11675,10 @@ mod tests {
             .iter()
             .any(|prop| matches!(prop, FilterProp::AttackedThisTurn)));
         assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
-        assert_eq!(def.active_zones, vec![Zone::Hand, Zone::Stack]);
+        assert_eq!(
+            def.active_zones,
+            vec![Zone::Hand, Zone::Stack, Zone::Command]
+        );
     }
 
     #[test]
@@ -11661,7 +11697,10 @@ mod tests {
             }
         ));
         assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
-        assert_eq!(def.active_zones, vec![Zone::Hand, Zone::Stack]);
+        assert_eq!(
+            def.active_zones,
+            vec![Zone::Hand, Zone::Stack, Zone::Command]
+        );
     }
 
     #[test]
@@ -11720,7 +11759,10 @@ mod tests {
             })
         );
         assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
-        assert_eq!(def.active_zones, vec![Zone::Hand, Zone::Stack]);
+        assert_eq!(
+            def.active_zones,
+            vec![Zone::Hand, Zone::Stack, Zone::Command]
+        );
     }
 
     #[test]
@@ -11813,7 +11855,10 @@ mod tests {
             }
         )));
         assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
-        assert_eq!(def.active_zones, vec![Zone::Hand, Zone::Stack]);
+        assert_eq!(
+            def.active_zones,
+            vec![Zone::Hand, Zone::Stack, Zone::Command]
+        );
     }
 
     #[test]

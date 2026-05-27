@@ -10608,7 +10608,10 @@ mod tests {
             .iter()
             .any(|prop| matches!(prop, FilterProp::AttackedThisTurn)));
         assert!(matches!(r.statics[0].affected, Some(TargetFilter::SelfRef)));
-        assert_eq!(r.statics[0].active_zones, vec![Zone::Hand, Zone::Stack]);
+        assert_eq!(
+            r.statics[0].active_zones,
+            vec![Zone::Hand, Zone::Stack, Zone::Command]
+        );
         assert!(
             r.parse_warnings
                 .iter()
