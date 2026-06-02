@@ -5701,6 +5701,11 @@ pub enum Effect {
     Populate,
     /// CR 701.30: Clash with an opponent — reveal top cards, compare mana values.
     Clash,
+    /// CR 724.1: End the turn. Exile every object on the stack, check
+    /// state-based actions, remove everything from combat, then skip straight
+    /// to the cleanup step. Time Stop, Sundial of the Infinite, Obeka,
+    /// Glorious End, Discontinuity, Day's Undoing.
+    EndTheTurn,
     /// CR 701.38: Vote — each player chooses one of the listed options, starting
     /// with a specified player and proceeding in turn order. After all votes are
     /// collected, the resolver runs `per_choice_effect[i]` once for each vote
@@ -7823,6 +7828,7 @@ impl Effect {
             | Effect::Proliferate
             | Effect::Populate
             | Effect::Clash
+            | Effect::EndTheTurn
             | Effect::Vote { .. }
             | Effect::Cleanup { .. }
             | Effect::RevealTop { .. }
@@ -7964,6 +7970,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::TimeTravel => "TimeTravel",
         Effect::BecomeMonarch => "BecomeMonarch",
         Effect::Proliferate => "Proliferate",
+        Effect::EndTheTurn => "EndTheTurn",
         Effect::Populate => "Populate",
         Effect::Clash => "Clash",
         Effect::Vote { .. } => "Vote",
@@ -8146,6 +8153,7 @@ pub enum EffectKind {
     Proliferate,
     Populate,
     Clash,
+    EndTheTurn,
     /// CR 701.38: Vote — interactive APNAP-ordered choice with per-choice tally effects.
     Vote,
     /// CR 700.3: SeparateIntoPiles — partition objects into two piles, another player chooses one, sub-effect applies.
@@ -8326,6 +8334,7 @@ impl From<&Effect> for EffectKind {
             Effect::TimeTravel => EffectKind::TimeTravel,
             Effect::BecomeMonarch => EffectKind::BecomeMonarch,
             Effect::Proliferate => EffectKind::Proliferate,
+            Effect::EndTheTurn => EffectKind::EndTheTurn,
             Effect::Populate => EffectKind::Populate,
             Effect::Clash => EffectKind::Clash,
             Effect::Vote { .. } => EffectKind::Vote,
