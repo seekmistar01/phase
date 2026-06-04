@@ -610,19 +610,22 @@ fn trigger_source_ids_for_zone(state: &GameState, zone: Zone) -> Vec<ObjectId> {
     }
 }
 
-fn source_was_in_zone_before_event(event: &GameEvent, source_id: ObjectId, zone: Zone) -> bool {
+fn source_was_not_co_departed_into_zone(
+    event: &GameEvent,
+    source_id: ObjectId,
+    zone: Zone,
+) -> bool {
     match event {
         // CR 603.2 + CR 702.59a: Off-zone triggers fire only if their source was
         // already functioning in the scanned zone when the trigger event
-        // occurred. A source that arrived in that zone as this zone-change event
-        // happened (including simultaneous co-departures) was not there yet for
-        // this event, so Recover-style graveyard triggers must not see it.
-        GameEvent::ZoneChanged {
-            object_id,
-            to,
-            record,
-            ..
-        } if *to == zone => *object_id != source_id && !record.co_departed.contains(&source_id),
+        // occurred. A source that co-departed into that zone as the triggering
+        // object moved there was not there yet for this event, so Recover-style
+        // graveyard triggers must not see it. The event object itself is not
+        // suppressed here: self-referential LTB triggers (Rancor class) still use
+        // the destination-zone scan plus CR 603.10a last-known information.
+        GameEvent::ZoneChanged { to, record, .. } if *to == zone => {
+            !record.co_departed.contains(&source_id)
+        }
         _ => true,
     }
 }
@@ -1439,7 +1442,7 @@ fn collect_pending_triggers(
         // firebending / exploit) deliberately do NOT run in this loop.
         for zone in [Zone::Graveyard, Zone::Exile, Zone::Stack, Zone::Command] {
             for obj_id in trigger_source_ids_for_zone(state, zone) {
-                if !source_was_in_zone_before_event(event, obj_id, zone) {
+                if !source_was_not_co_departed_into_zone(event, obj_id, zone) {
                     continue;
                 }
                 let matched_triggers = {
