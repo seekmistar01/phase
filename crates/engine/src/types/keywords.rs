@@ -651,6 +651,13 @@ pub enum Keyword {
     Melee,
     Mentor,
     Myriad,
+    /// CR 702.39a: Provoke — "Whenever this creature attacks, you may have
+    /// target creature defending player controls untap and block it this turn
+    /// if able." Synthesized into an optional Attacks trigger (untap + the
+    /// source-referential `Effect::ForceBlock`) in `database::synthesis`.
+    /// CR number mirrors the consistent annotations on the resolution path
+    /// (`StaticMode::MustBlockAttacker`, `game/effects/force_block.rs`); needs
+    /// manual CR verification (docs/MagicCompRules.txt absent here).
     Provoke,
     Rebound,
     Retrace,
