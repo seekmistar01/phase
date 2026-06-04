@@ -9150,6 +9150,63 @@ mod provoke_synthesis_tests {
             &Keyword::Mentor
         ));
     }
+
+    /// CR 702.39b: if a creature has multiple instances of Provoke, each
+    /// triggers separately. MTGJSON dedupes the keyword array to one "Provoke",
+    /// so `build_oracle_face` must recover repeated printed bare words from
+    /// Oracle text before `synthesize_all` installs one trigger per instance.
+    #[test]
+    fn build_oracle_face_recovers_repeated_provoke_instances_from_oracle_text() {
+        let mtgjson = AtomicCard {
+            name: "Repeated Provoke Test".to_string(),
+            mana_cost: Some("{2}{G}".to_string()),
+            colors: vec!["G".to_string()],
+            color_identity: vec!["G".to_string()],
+            power: Some("2".to_string()),
+            toughness: Some("2".to_string()),
+            loyalty: None,
+            defense: None,
+            text: Some("Provoke, provoke".to_string()),
+            layout: "normal".to_string(),
+            type_line: Some("Creature — Beast".to_string()),
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Beast".to_string()],
+            supertypes: Vec::new(),
+            keywords: Some(vec!["Provoke".to_string()]),
+            side: None,
+            face_name: None,
+            mana_value: 3.0,
+            legalities: Default::default(),
+            leadership_skills: None,
+            printings: Vec::new(),
+            rulings: Vec::new(),
+            is_game_changer: false,
+            identifiers: crate::database::mtgjson::AtomicIdentifiers {
+                scryfall_id: None,
+                scryfall_oracle_id: None,
+            },
+            foreign_data: Vec::new(),
+        };
+
+        let face = build_oracle_face(&mtgjson, None);
+
+        assert_eq!(
+            face.keywords
+                .iter()
+                .filter(|keyword| matches!(keyword, Keyword::Provoke))
+                .count(),
+            2,
+            "Oracle text must recover repeated Provoke instances that MTGJSON dedupes"
+        );
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_provoke_attack_trigger(trigger))
+                .count(),
+            2,
+            "CR 702.39b: each recovered Provoke instance triggers separately"
+        );
+    }
 }
 
 #[cfg(test)]
