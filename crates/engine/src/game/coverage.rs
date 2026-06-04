@@ -8368,6 +8368,19 @@ mod tests {
     }
 
     #[test]
+    fn apnap_swallowed_clause_warning_counts_as_coverage_gap() {
+        let warnings = vec![OracleDiagnostic::SwallowedClause {
+            detector: "APNAP".to_string(),
+            description: "Repeat the following process for each opponent in turn order."
+                .to_string(),
+            line_index: 0,
+        }];
+        let mut missing = Vec::new();
+        check_parse_warnings(&warnings, &mut missing);
+        assert_eq!(missing, vec!["Swallow:APNAP"]);
+    }
+
+    #[test]
     fn swallowed_clause_warning_counts_as_coverage_gap() {
         let warnings = vec![
             crate::parser::oracle_ir::diagnostic::OracleDiagnostic::SwallowedClause {
