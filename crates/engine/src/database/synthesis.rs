@@ -3434,7 +3434,7 @@ fn build_annihilator_trigger(n: u32) -> TriggerDefinition {
         ))
 }
 
-/// CR 702.39a: A Provoke `n` trigger — a self-scoped (`valid_card: SelfRef`)
+/// CR 702.39a: A Provoke trigger — a self-scoped (`valid_card: SelfRef`)
 /// `Attacks` trigger whose execute body untaps a creature the defending player
 /// controls (`Effect::Untap` targeting a `ControllerRef::DefendingPlayer`
 /// creature) and chains an `Effect::ForceBlock` on that same target via
@@ -3497,11 +3497,6 @@ fn is_provoke_attack_trigger(t: &TriggerDefinition) -> bool {
 /// (CR 702.39a + CR 509.1c), enforced in `combat.rs` declare-blockers
 /// validation. No force-block logic is reimplemented here.
 ///
-/// NOTE: `docs/MagicCompRules.txt` is absent in this environment, so CR 702.39a
-/// here mirrors the already-present, consistent annotations on
-/// `Keyword::Provoke`'s resolution path (`StaticMode::MustBlockAttacker` in
-/// `types/statics.rs` and `game/effects/force_block.rs`). Needs manual CR
-/// verification against the Comprehensive Rules.
 fn build_provoke_trigger() -> TriggerDefinition {
     // CR 702.39a: "target creature defending player controls". `DefendingPlayer`
     // routes to `defending_player_for_attacker(state, source_id)` at
