@@ -251,10 +251,8 @@ impl KeywordTriggerInstaller {
             // each instance triggers separately; one trigger per `Battlecry`.
             Keyword::Battlecry => vec![build_battlecry_trigger()],
             Keyword::Dethrone => vec![build_dethrone_trigger()],
-            // CR 702.59a (needs manual CR verification — docs/MagicCompRules.txt
-            // absent in this environment; number mirrors the existing
-            // `Keyword::Recover` doc comment): Recover {cost} — graveyard-sourced
-            // dies trigger with a mandatory pay-or-else-exile branch.
+            // CR 702.59a: Recover {cost} — graveyard-sourced dies trigger with
+            // a mandatory pay-or-else-exile branch.
             Keyword::Recover(cost) => vec![build_recover_trigger(cost.clone())],
             Keyword::Evolve => vec![build_evolve_trigger()],
             Keyword::Exalted => vec![build_exalted_trigger()],
@@ -305,8 +303,8 @@ impl KeywordTriggerInstaller {
             Keyword::Bushido(n) => is_bushido_trigger(trigger, *n),
             Keyword::Battlecry => is_battlecry_trigger(trigger),
             Keyword::Dethrone => is_dethrone_attack_trigger(trigger),
-            // CR 702.59a (needs manual CR verification): symmetric removal —
-            // identifies the synthesized Recover dies trigger.
+            // CR 702.59a: symmetric removal identifies the synthesized Recover
+            // dies trigger.
             Keyword::Recover(_) => is_recover_trigger(trigger),
             Keyword::Evolve => is_evolve_trigger(trigger),
             Keyword::Exalted => is_exalted_trigger(trigger),
@@ -4071,11 +4069,9 @@ fn build_recover_self_change_zone(destination: Zone) -> Effect {
     }
 }
 
-/// CR 702.59a (needs manual CR verification — docs/MagicCompRules.txt absent in
-/// this environment; the number mirrors the existing `Keyword::Recover` doc
-/// comment): Recover {cost} — "When a creature is put into your graveyard from
-/// the battlefield, you may pay [cost]. If you do, return this card from your
-/// graveyard to your hand. Otherwise, exile this card."
+/// CR 702.59a: Recover {cost} — "When a creature is put into your graveyard
+/// from the battlefield, you may pay [cost]. If you do, return this card from
+/// your graveyard to your hand. Otherwise, exile this card."
 ///
 /// Modeled by reusing the unless-pay/pay-with-else machinery
 /// (`AbilityDefinition.unless_pay` + the `IfAPlayerDoes`/effect-performed
@@ -4093,8 +4089,8 @@ fn build_recover_self_change_zone(destination: Zone) -> Effect {
 ///
 /// The trigger is GRAVEYARD-SOURCED: `trigger_zones = [Graveyard]` because the
 /// Recover card itself is in the graveyard when it fires, keying on ANOTHER
-/// creature the controller controls dying (`ChangesZone` Battlefield→Graveyard,
-/// `valid_card` = another creature you control). Both branches act on `SelfRef`
+/// creature put into your graveyard (`ChangesZone` Battlefield→Graveyard,
+/// `valid_card` = another creature you own). Both branches act on `SelfRef`
 /// (this card in the graveyard).
 ///
 /// Single source of truth for the Recover trigger shape, shared by the printed
@@ -4124,20 +4120,20 @@ fn build_recover_trigger(cost: ManaCost) -> TriggerDefinition {
     .sub_ability(return_to_hand)
     .description("Otherwise, exile this card".to_string());
 
-    // CR 109.3 + CR 702.59a: "a creature is put into your graveyard from the
-    // battlefield" — another creature you control dying. `FilterProp::Another`
-    // excludes the Recover card itself; `ControllerRef::You` restricts to
-    // creatures the Recover card's controller controls.
-    let another_creature_you_control = TargetFilter::Typed(
-        TypedFilter::creature()
-            .properties(vec![FilterProp::Another])
-            .controller(ControllerRef::You),
-    );
+    // CR 404.1 + CR 702.59a: "your graveyard" means the creature is put into
+    // its owner's graveyard. `FilterProp::Another` excludes the Recover card
+    // itself; `Owned(You)` restricts to cards owned by the Recover controller.
+    let another_creature_you_own = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+        FilterProp::Another,
+        FilterProp::Owned {
+            controller: ControllerRef::You,
+        },
+    ]));
 
     let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
         .origin(Zone::Battlefield)
         .destination(Zone::Graveyard)
-        .valid_card(another_creature_you_control)
+        .valid_card(another_creature_you_own)
         .execute(execute)
         .description(
             "CR 702.59a: Recover — when a creature is put into your graveyard from the battlefield, you may pay the recover cost; if you do, return this card from your graveyard to your hand, otherwise exile this card."
@@ -4150,7 +4146,7 @@ fn build_recover_trigger(cost: ManaCost) -> TriggerDefinition {
 
 /// Idempotency / symmetric-removal shape predicate for the Recover dies trigger.
 /// True iff `t` is a graveyard-sourced (`trigger_zones` includes `Graveyard`)
-/// `ChangesZone` Battlefield→Graveyard trigger on another creature you control
+/// `ChangesZone` Battlefield→Graveyard trigger on another creature you own
 /// whose execute body exiles `SelfRef` from the graveyard under an `unless_pay`
 /// modifier, with a `effect_performed`-gated sub-ability returning `SelfRef` to
 /// hand. The cost value is not inspected (cost-independent shape).
@@ -4165,7 +4161,11 @@ fn is_recover_trigger(t: &TriggerDefinition) -> bool {
     let Some(TargetFilter::Typed(tf)) = t.valid_card.as_ref() else {
         return false;
     };
-    if !tf.properties.contains(&FilterProp::Another) || tf.controller != Some(ControllerRef::You) {
+    if !tf.properties.contains(&FilterProp::Another)
+        || !tf.properties.contains(&FilterProp::Owned {
+            controller: ControllerRef::You,
+        })
+    {
         return false;
     }
     let Some(execute) = t.execute.as_deref() else {
@@ -4198,8 +4198,8 @@ fn is_recover_trigger(t: &TriggerDefinition) -> bool {
     exiles_self && has_unless_pay && returns_self_to_hand
 }
 
-/// CR 702.59a (needs manual CR verification): Recover {cost} — graveyard-sourced
-/// dies trigger with a mandatory pay-or-else-exile branch. Synthesized via the
+/// CR 702.59a: Recover {cost} — graveyard-sourced dies trigger with a
+/// mandatory pay-or-else-exile branch. Synthesized via the
 /// shared `install_matching` installer so the printed and runtime-granted paths
 /// share the single `build_recover_trigger` shape. Per the absence of a
 /// redundancy clause every `Keyword::Recover` instance functions independently,
@@ -6032,10 +6032,11 @@ pub fn synthesize_all(face: &mut CardFace) {
     // creature whenever it attacks the player with the most life or tied for
     // most life. CR 702.105b: each instance triggers separately.
     synthesize_dethrone(face);
-    // CR 702.59a (needs manual CR verification): Recover {cost} —
-    // graveyard-sourced dies trigger with a mandatory pay-or-else-exile branch.
-    // When another creature you control dies, you may pay the recover cost to
-    // return this card from your graveyard to your hand; otherwise exile it.
+    // CR 702.59a: Recover {cost} — graveyard-sourced dies trigger with a
+    // mandatory pay-or-else-exile branch.
+    // When another creature is put into your graveyard, you may pay the recover
+    // cost to return this card from your graveyard to your hand; otherwise
+    // exile it.
     synthesize_recover(face);
     // CR 702.100a: Evolve — ETB trigger that puts a +1/+1 counter on the
     // creature whenever another creature you control enters with greater power
@@ -13567,7 +13568,7 @@ mod recover_synthesis_tests {
             "Recover trigger must be active from the graveyard zone"
         );
 
-        // valid_card = another creature you control.
+        // valid_card = another creature you own.
         match trigger.valid_card.as_ref() {
             Some(TargetFilter::Typed(tf)) => {
                 assert!(tf
@@ -13575,9 +13576,12 @@ mod recover_synthesis_tests {
                     .iter()
                     .any(|f| matches!(f, TypeFilter::Creature)));
                 assert!(tf.properties.contains(&FilterProp::Another));
-                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::You,
+                }));
+                assert_eq!(tf.controller, None);
             }
-            other => panic!("expected Typed(another creature you control), got {other:?}"),
+            other => panic!("expected Typed(another creature you own), got {other:?}"),
         }
     }
 
