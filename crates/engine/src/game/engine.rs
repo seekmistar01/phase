@@ -1634,6 +1634,18 @@ fn apply_action(
                         &mut events,
                     )?
                 }
+                AlternativeCastKeyword::Mutate => {
+                    // CR 702.140a: Handle the mutate alternative cost choice.
+                    casting::handle_mutate_cost_choice_with_payment_mode(
+                        state,
+                        *player,
+                        *object_id,
+                        *card_id,
+                        choice,
+                        *payment_mode,
+                        &mut events,
+                    )?
+                }
                 AlternativeCastKeyword::Cleave => {
                     casting::handle_cleave_cost_choice_with_payment_mode(
                         state,
@@ -2859,9 +2871,12 @@ fn apply_action(
             mulligan::handle_opening_hand_bottom(state, actor, cards, &mut events)
                 .map_err(EngineError::InvalidAction)?
         }
-        (WaitingFor::DeclareAttackers { player, .. }, GameAction::DeclareAttackers { attacks }) => {
+        (
+            WaitingFor::DeclareAttackers { player, .. },
+            GameAction::DeclareAttackers { attacks, bands },
+        ) => {
             triggers_processed_inline = true;
-            engine_combat::handle_declare_attackers(state, *player, &attacks, &mut events)?
+            engine_combat::handle_declare_attackers(state, *player, &attacks, &bands, &mut events)?
         }
         (
             WaitingFor::DeclareBlockers { player, .. },
@@ -3976,6 +3991,28 @@ fn apply_action(
                 &assignments,
                 trample_damage,
                 controller_damage,
+                &mut events,
+            )?
+        }
+        // CR 510.1d + CR 702.22k: A banded blocker's combat damage is divided by
+        // the active player among the attackers it blocks.
+        (
+            WaitingFor::AssignBlockerDamage {
+                player,
+                blocker_id,
+                total_damage,
+                attackers,
+            },
+            GameAction::AssignBlockerDamage { assignments },
+        ) => {
+            triggers_processed_inline = true;
+            engine_combat::handle_assign_blocker_damage(
+                state,
+                *player,
+                *blocker_id,
+                *total_damage,
+                attackers,
+                &assignments,
                 &mut events,
             )?
         }
@@ -6980,6 +7017,7 @@ mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(bombardiers, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -9780,6 +9818,7 @@ mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -15336,6 +15375,7 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(ajani, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -15529,6 +15569,7 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(bat, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -18150,6 +18191,7 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
