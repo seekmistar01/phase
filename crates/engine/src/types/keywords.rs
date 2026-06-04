@@ -749,7 +749,12 @@ pub enum Keyword {
     /// works separately.
     Sunburst,
     /// CR 702.72a: Champion a [type] — exile a creature of the specified type you control
-    /// when this enters; return it when this leaves.
+    /// when this enters; return it when this leaves. Wired at build time by
+    /// `synthesize_champion`: CR 702.72b (ETB exile-or-sacrifice) + CR 702.72c
+    /// (LTB return the linked exiled card), reusing the
+    /// `ExileLinkKind::UntilSourceLeaves` linkage infra.
+    /// (CR 702.72a/b/c numbers consistent with prior annotation; `docs/MagicCompRules.txt`
+    /// is absent in this checkout — needs manual CR verification.)
     Champion(String),
     /// CR 702.149a: Training — whenever this creature attacks with another creature
     /// with greater power, put a +1/+1 counter on this creature.

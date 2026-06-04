@@ -256,6 +256,14 @@ impl KeywordTriggerInstaller {
                 build_suspend_upkeep_removal_trigger(),
                 build_suspend_last_counter_cast_trigger(),
             ],
+            // CR 702.72b + CR 702.72c: Champion a[n] [type] — paired
+            // ETB-exile-or-sacrifice and LTB-return-linked-card triggers. See
+            // `build_champion_triggers` for the linkage rationale. Granted
+            // Champion (CR 604.1) installs both triggers; the ETB trigger's
+            // "when this enters" window has already passed for a runtime grant
+            // (mirroring Graft), so in practice only the LTB return matters
+            // off-grant, and it safely no-ops when no exile link exists.
+            Keyword::Champion(type_str) => build_champion_triggers(type_str),
             _ => Vec::new(),
         }
     }
@@ -291,6 +299,13 @@ impl KeywordTriggerInstaller {
             // both suspend triggers when the granted keyword is removed.
             Keyword::Suspend { .. } => {
                 is_suspend_upkeep_trigger(trigger) || is_suspend_last_counter_trigger(trigger)
+            }
+            // CR 702.72b + CR 702.72c + CR 604.1: symmetric removal — both the
+            // ETB exile-or-sacrifice trigger and the LTB return trigger are
+            // recognized so `RemoveKeyword` strips exactly what Champion added.
+            Keyword::Champion(type_str) => {
+                is_champion_etb_trigger(trigger, type_str)
+                    || is_champion_ltb_return_trigger(trigger)
             }
             _ => false,
         }
@@ -4560,6 +4575,227 @@ pub fn synthesize_backup(face: &mut CardFace) {
     }
 }
 
+/// CR 702.72b: Build the `TargetFilter` for "another [type] you control" — the
+/// permanent the controller may exile to avoid sacrificing the championing
+/// permanent. The `type_str` is the capitalized Champion payload (e.g.
+/// "Kithkin", "Dragon"); per CR 702.72a it always names a creature type. A
+/// payload of "Creature" (cards that champion a creature of any type) yields a
+/// bare creature filter with no subtype constraint.
+///
+/// `FilterProp::Another` enforces the "another" clause (CR 109.1): the
+/// championing permanent itself can never be the exiled creature.
+fn champion_type_filter(type_str: &str) -> TargetFilter {
+    let mut filter = TypedFilter::creature()
+        .controller(ControllerRef::You)
+        .properties(vec![FilterProp::Another]);
+    if !type_str.eq_ignore_ascii_case("creature") {
+        filter = filter.subtype(type_str.to_string());
+    }
+    TargetFilter::Typed(filter)
+}
+
+/// CR 702.72b + CR 702.72c: Build Champion's paired triggers from the keyword's
+/// `[type]` payload.
+///
+/// **Linkage (the load-bearing design decision).** The exiled card and the
+/// championing permanent must be linked so the SAME card returns when the
+/// permanent leaves. The engine's single linked-exile-return mechanism is
+/// `ExileLinkKind::UntilSourceLeaves`, created by the `Effect::ChangeZone`
+/// resolver whenever the exile carries `Duration::UntilHostLeavesPlay`
+/// (`change_zone.rs`), and consumed by `check_exile_returns` (`engine.rs`) when
+/// the source leaves the battlefield. This is the exact infrastructure Fiend
+/// Hunter / Banisher Priest / Oblivion Ring reuse via
+/// `synthesize_etb_exile_ltb_return_pair` in the parser. Champion reuses it
+/// rather than inventing a parallel link system.
+///
+/// Note this rules out modeling CR 702.72b as a literal "sacrifice it unless
+/// you pay [Exile cost]" (`UnlessPayModifier { cost: AbilityCost::Exile }`):
+/// exile-as-COST never creates an `UntilSourceLeaves` link, so the championed
+/// card would be lost forever. Instead the ETB is a controller choice
+/// (`Effect::ChooseOneOf`, the Fabricate shape) between exiling-with-link and
+/// sacrificing — which is rules-equivalent to "sacrifice unless you exile" and
+/// routes the exile through the linking `ChangeZone` path.
+///
+/// 1. ETB (CR 702.72b): "When this permanent enters, sacrifice it unless you
+///    exile another [type] you control." Modeled as `ChooseOneOf` with two
+///    branches. Branch A is a `ChangeZone` exile of a chosen "another [type] you
+///    control" carrying `Duration::UntilHostLeavesPlay` (creates the link).
+///    Branch B is a `Sacrifice` of the championing permanent.
+/// 2. LTB (CR 702.72c): "When this permanent leaves the battlefield, return the
+///    exiled card to the battlefield under its owner's control." Modeled as a
+///    `LeavesBattlefield` trigger returning `TargetFilter::ExiledBySource`
+///    (resolved from `state.exile_links`). The `UntilSourceLeaves` mechanism
+///    already returns the card automatically when the source leaves, so this
+///    trigger gracefully no-ops if the link has already fired — mirroring the
+///    Journey-to-Nowhere two-trigger design.
+fn build_champion_triggers(type_str: &str) -> Vec<TriggerDefinition> {
+    vec![
+        build_champion_etb_trigger(type_str),
+        build_champion_ltb_return_trigger(),
+    ]
+}
+
+fn build_champion_etb_trigger(type_str: &str) -> TriggerDefinition {
+    // CR 702.72b branch A: "exile another [type] you control." The exile
+    // carries `Duration::UntilHostLeavesPlay` so the `ChangeZone` resolver
+    // records an `ExileLinkKind::UntilSourceLeaves { return_zone: Battlefield }`
+    // link to the championing permanent.
+    let exile_branch = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZone {
+            origin: Some(Zone::Battlefield),
+            destination: Zone::Exile,
+            target: champion_type_filter(type_str),
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: false,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: Vec::new(),
+            face_down_profile: None,
+        },
+    )
+    .duration(Duration::UntilHostLeavesPlay)
+    .description(format!("Exile another {type_str} you control"));
+
+    // CR 702.72b branch B + CR 701.21a: "sacrifice it" — sacrifice the
+    // championing permanent itself.
+    let sacrifice_branch = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Sacrifice {
+            target: TargetFilter::SelfRef,
+            count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
+        },
+    )
+    .description("Sacrifice this permanent".to_string());
+
+    let choose = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![exile_branch, sacrifice_branch],
+        },
+    );
+
+    TriggerDefinition::new(TriggerMode::ChangesZone)
+        .destination(Zone::Battlefield)
+        .valid_card(TargetFilter::SelfRef)
+        .trigger_zones(vec![Zone::Battlefield])
+        .execute(choose)
+        .description(format!(
+            "CR 702.72b: Champion a{} {type_str} — when this permanent enters, sacrifice it unless you exile another {type_str} you control.",
+            if starts_with_vowel_sound(type_str) { "n" } else { "" }
+        ))
+}
+
+fn build_champion_ltb_return_trigger() -> TriggerDefinition {
+    // CR 702.72c: "return the exiled card to the battlefield under its owner's
+    // control." `TargetFilter::ExiledBySource` resolves the linked card from
+    // `state.exile_links`; `owner_library: false` keeps the return under the
+    // owner (not the controller). The card returns to the battlefield.
+    let return_ability = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZone {
+            origin: Some(Zone::Exile),
+            destination: Zone::Battlefield,
+            target: TargetFilter::ExiledBySource,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: false,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: Vec::new(),
+            face_down_profile: None,
+        },
+    )
+    .description("Return the exiled card to the battlefield under its owner's control".to_string());
+
+    TriggerDefinition::new(TriggerMode::LeavesBattlefield)
+        .valid_card(TargetFilter::SelfRef)
+        .trigger_zones(vec![Zone::Battlefield])
+        .execute(return_ability)
+        .description(
+            "CR 702.72c: Champion — when this permanent leaves the battlefield, return the exiled card to the battlefield under its owner's control."
+                .to_string(),
+        )
+}
+
+/// Heuristic for the "a"/"an" article in Champion's display description. Not a
+/// game rule — display-only.
+fn starts_with_vowel_sound(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u'))
+}
+
+/// Idempotency / runtime-removal shape predicate for Champion's ETB trigger.
+/// True iff `trigger` is an ETB (→ Battlefield) trigger on `SelfRef` whose
+/// execute body is a `ChooseOneOf` between an `UntilHostLeavesPlay` exile of
+/// "another [type] you control" and a self-`Sacrifice`.
+fn is_champion_etb_trigger(t: &TriggerDefinition, type_str: &str) -> bool {
+    if !matches!(t.mode, TriggerMode::ChangesZone)
+        || t.destination != Some(Zone::Battlefield)
+        || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return false;
+    }
+    let Some(Effect::ChooseOneOf { branches, .. }) = t.execute.as_deref().map(|a| &*a.effect)
+    else {
+        return false;
+    };
+    let has_exile = branches.iter().any(|b| {
+        b.duration == Some(Duration::UntilHostLeavesPlay)
+            && matches!(
+                &*b.effect,
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    target,
+                    ..
+                } if *target == champion_type_filter(type_str)
+            )
+    });
+    let has_sacrifice = branches.iter().any(|b| {
+        matches!(
+            &*b.effect,
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        )
+    });
+    has_exile && has_sacrifice
+}
+
+/// Idempotency / runtime-removal shape predicate for Champion's LTB trigger.
+/// True iff `trigger` is a `LeavesBattlefield` trigger on `SelfRef` whose
+/// execute returns `TargetFilter::ExiledBySource` to the battlefield.
+fn is_champion_ltb_return_trigger(t: &TriggerDefinition) -> bool {
+    if !matches!(t.mode, TriggerMode::LeavesBattlefield)
+        || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return false;
+    }
+    matches!(
+        t.execute.as_deref().map(|a| &*a.effect),
+        Some(Effect::ChangeZone {
+            destination: Zone::Battlefield,
+            target: TargetFilter::ExiledBySource,
+            ..
+        })
+    )
+}
+
+/// CR 702.72b + CR 702.72c: Champion a[n] [type] — install the paired
+/// ETB-exile-or-sacrifice and LTB-return-linked-card triggers. Reuses the
+/// `install_matching` chokepoint so the synthesis is idempotent and shares the
+/// CR 604.1 runtime-grant/removal path with the other keyword triggers.
+pub fn synthesize_champion(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Champion(_)));
+}
+
 /// CR 702.58a: Graft N — represents both a static ability and a triggered
 /// ability. "Graft N" means "This permanent enters with N +1/+1 counters on
 /// it" AND "Whenever another creature enters, if this permanent has a +1/+1
@@ -5513,6 +5749,11 @@ pub fn synthesize_all(face: &mut CardFace) {
     // CR 702.165: Backup — ETB trigger placing +1/+1 counters and granting
     // non-Backup abilities printed below Backup until end of turn.
     synthesize_backup(face);
+    // CR 702.72b + CR 702.72c: Champion a[n] [type] — ETB trigger that exiles
+    // (linked) another creature of the championed type you control or else
+    // sacrifices this permanent, plus an LTB trigger that returns the linked
+    // exiled card. Reuses the `ExileLinkKind::UntilSourceLeaves` linkage infra.
+    synthesize_champion(face);
 }
 
 /// CR 702.176a: Synthesize Impending's battlefield static and end-step trigger.
@@ -16268,5 +16509,238 @@ mod sunburst_runtime_tests {
             0,
             "a noncreature Sunburst must not place +1/+1 counters (CR 702.44a)"
         );
+    }
+}
+
+/// CR 702.72b + CR 702.72c synthesis-shape coverage for Champion.
+///
+/// Runtime-coverage boundary: the ETB exile branch routes through the existing
+/// `Effect::ChangeZone` + `Duration::UntilHostLeavesPlay` resolver, which
+/// creates the `ExileLinkKind::UntilSourceLeaves` link, and the LTB return is
+/// driven by `check_exile_returns` (`engine.rs`). Both runtime paths are
+/// already directly covered by the generic `UntilSourceLeaves` tests in
+/// `engine.rs` (e.g. `exile_return_*`). These shape tests assert the
+/// synthesized triggers have exactly the structure that plugs into that proven
+/// infrastructure, rather than re-driving the shared interactive
+/// ChooseOneOf/exile-target/leave pipeline.
+#[cfg(test)]
+mod champion_synthesis_tests {
+    use super::*;
+    use crate::types::card_type::CoreType;
+
+    /// Soulshifter Drake-like face: a creature with "Champion an Elf".
+    fn face_with_champion(type_str: &str) -> CardFace {
+        CardFace {
+            name: "Test Championer".to_string(),
+            oracle_text: Some(format!(
+                "Champion a{} {type_str}",
+                if type_str
+                    .chars()
+                    .next()
+                    .is_some_and(|c| "aeiou".contains(c.to_ascii_lowercase()))
+                {
+                    "n"
+                } else {
+                    ""
+                }
+            )),
+            keywords: vec![Keyword::Champion(type_str.to_string())],
+            card_type: CardType {
+                core_types: vec![CoreType::Creature],
+                ..Default::default()
+            },
+            ..CardFace::default()
+        }
+    }
+
+    /// CR 702.72b: Champion synthesizes an ETB trigger that is a `ChooseOneOf`
+    /// between exiling (linked) another creature of the championed type you
+    /// control and sacrificing this permanent.
+    #[test]
+    fn synthesize_champion_adds_etb_exile_or_sacrifice_trigger() {
+        let mut face = face_with_champion("Elf");
+        synthesize_champion(&mut face);
+
+        let etb = face
+            .triggers
+            .iter()
+            .find(|t| is_champion_etb_trigger(t, "Elf"))
+            .expect("Champion ETB trigger should be synthesized");
+
+        assert_eq!(etb.mode, TriggerMode::ChangesZone);
+        assert_eq!(etb.destination, Some(Zone::Battlefield));
+        assert!(matches!(etb.valid_card, Some(TargetFilter::SelfRef)));
+
+        let Some(Effect::ChooseOneOf { branches, chooser }) =
+            etb.execute.as_deref().map(|a| &*a.effect)
+        else {
+            panic!("expected ChooseOneOf ETB execute");
+        };
+        assert_eq!(*chooser, PlayerFilter::Controller);
+        assert_eq!(branches.len(), 2, "exile branch + sacrifice branch");
+
+        // Exile branch: links via UntilHostLeavesPlay; targets "another Elf you control".
+        let exile = branches
+            .iter()
+            .find(|b| b.duration == Some(Duration::UntilHostLeavesPlay))
+            .expect("exile branch must carry UntilHostLeavesPlay for the linked return");
+        match &*exile.effect {
+            Effect::ChangeZone {
+                destination,
+                target,
+                ..
+            } => {
+                assert_eq!(*destination, Zone::Exile);
+                // CR 702.72b: "another [type] you control".
+                assert_eq!(*target, champion_type_filter("Elf"));
+                match target {
+                    TargetFilter::Typed(tf) => {
+                        assert_eq!(tf.controller, Some(ControllerRef::You));
+                        assert!(tf.properties.contains(&FilterProp::Another));
+                        assert!(tf
+                            .type_filters
+                            .iter()
+                            .any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Elf")));
+                        assert!(tf
+                            .type_filters
+                            .iter()
+                            .any(|f| matches!(f, TypeFilter::Creature)));
+                    }
+                    other => panic!("expected Typed exile filter, got {other:?}"),
+                }
+            }
+            other => panic!("expected ChangeZone exile, got {other:?}"),
+        }
+
+        // Sacrifice branch: self-sacrifice.
+        let sacrifice = branches
+            .iter()
+            .find(|b| matches!(&*b.effect, Effect::Sacrifice { .. }))
+            .expect("sacrifice branch must exist");
+        assert!(matches!(
+            &*sacrifice.effect,
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ));
+    }
+
+    /// CR 702.72c: Champion synthesizes an LTB trigger that returns the linked
+    /// exiled card (`ExiledBySource`) to the battlefield.
+    #[test]
+    fn synthesize_champion_adds_ltb_return_trigger() {
+        let mut face = face_with_champion("Elf");
+        synthesize_champion(&mut face);
+
+        let ltb = face
+            .triggers
+            .iter()
+            .find(|t| is_champion_ltb_return_trigger(t))
+            .expect("Champion LTB return trigger should be synthesized");
+
+        assert_eq!(ltb.mode, TriggerMode::LeavesBattlefield);
+        assert!(matches!(ltb.valid_card, Some(TargetFilter::SelfRef)));
+        match ltb.execute.as_deref().map(|a| &*a.effect) {
+            Some(Effect::ChangeZone {
+                origin,
+                destination,
+                target,
+                owner_library,
+                ..
+            }) => {
+                assert_eq!(*origin, Some(Zone::Exile));
+                assert_eq!(*destination, Zone::Battlefield);
+                // CR 610.3: returns the card linked via state.exile_links.
+                assert_eq!(*target, TargetFilter::ExiledBySource);
+                // CR 702.72c: "under its owner's control".
+                assert!(!owner_library);
+            }
+            other => panic!("expected ChangeZone return, got {other:?}"),
+        }
+    }
+
+    /// The "Champion a creature" payload (no subtype) yields a bare creature
+    /// filter — still "another creature you control", with no subtype constraint.
+    #[test]
+    fn synthesize_champion_creature_payload_has_no_subtype() {
+        let filter = champion_type_filter("creature");
+        match filter {
+            TargetFilter::Typed(tf) => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf.properties.contains(&FilterProp::Another));
+                assert!(!tf
+                    .type_filters
+                    .iter()
+                    .any(|f| matches!(f, TypeFilter::Subtype(_))));
+                assert!(tf
+                    .type_filters
+                    .iter()
+                    .any(|f| matches!(f, TypeFilter::Creature)));
+            }
+            other => panic!("expected Typed filter, got {other:?}"),
+        }
+    }
+
+    /// Re-running synthesis must not duplicate either trigger (idempotent via
+    /// the `install_matching` chokepoint).
+    #[test]
+    fn synthesize_champion_is_idempotent() {
+        let mut face = face_with_champion("Goblin");
+        synthesize_champion(&mut face);
+        synthesize_champion(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_champion_etb_trigger(t, "Goblin"))
+                .count(),
+            1,
+            "ETB trigger must not duplicate"
+        );
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_champion_ltb_return_trigger(t))
+                .count(),
+            1,
+            "LTB trigger must not duplicate"
+        );
+    }
+
+    /// A face without Champion gets no Champion triggers.
+    #[test]
+    fn synthesize_champion_is_noop_without_keyword() {
+        let mut face = CardFace {
+            name: "Plain Creature".to_string(),
+            keywords: vec![Keyword::Flying],
+            card_type: CardType {
+                core_types: vec![CoreType::Creature],
+                ..Default::default()
+            },
+            ..CardFace::default()
+        };
+        synthesize_champion(&mut face);
+        assert!(face.triggers.is_empty());
+    }
+
+    /// CR 604.1: the runtime-grant chokepoint returns both triggers, and the
+    /// kind-matcher recognizes each — so `RemoveKeyword` strips exactly what
+    /// Champion added.
+    #[test]
+    fn champion_triggers_for_and_kind_match() {
+        let kw = Keyword::Champion("Dragon".to_string());
+        let triggers = KeywordTriggerInstaller::triggers_for(&kw);
+        assert_eq!(triggers.len(), 2, "ETB + LTB");
+        for trigger in &triggers {
+            assert!(
+                KeywordTriggerInstaller::trigger_matches_keyword_kind(trigger, &kw),
+                "each synthesized trigger must be recognized by its keyword kind"
+            );
+        }
+        // The ETB-kind matcher is type-specific: a Dragon trigger is not an Elf trigger.
+        let elf_etb = build_champion_etb_trigger("Elf");
+        assert!(!is_champion_etb_trigger(&elf_etb, "Dragon"));
+        assert!(is_champion_etb_trigger(&elf_etb, "Elf"));
     }
 }
