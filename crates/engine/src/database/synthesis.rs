@@ -243,9 +243,16 @@ impl KeywordTriggerInstaller {
                 build_bushido_trigger(TriggerMode::Blocks, *n),
                 build_bushido_trigger(TriggerMode::BecomesBlocked, *n),
             ],
+            // CR 702.91a: Battle cry — whenever this creature attacks, each
+            // other attacking creature gets +1/+0 until end of turn. CR 702.91b:
+            // each instance triggers separately; one trigger per `Battlecry`.
+            Keyword::Battlecry => vec![build_battlecry_trigger()],
             Keyword::Dethrone => vec![build_dethrone_trigger()],
             Keyword::Evolve => vec![build_evolve_trigger()],
             Keyword::Exalted => vec![build_exalted_trigger()],
+            // CR 702.25a: Flanking — a becomes-blocked debuff trigger. CR 702.25b:
+            // each instance triggers separately (one trigger per instance).
+            Keyword::Flanking => vec![build_flanking_trigger()],
             Keyword::Extort => vec![build_extort_trigger()],
             Keyword::Increment => vec![build_increment_trigger()],
             Keyword::Myriad => vec![build_myriad_trigger()],
@@ -287,9 +294,11 @@ impl KeywordTriggerInstaller {
             // removed.
             Keyword::Graft(_) => is_graft_enters_trigger(trigger),
             Keyword::Bushido(n) => is_bushido_trigger(trigger, *n),
+            Keyword::Battlecry => is_battlecry_trigger(trigger),
             Keyword::Dethrone => is_dethrone_attack_trigger(trigger),
             Keyword::Evolve => is_evolve_trigger(trigger),
             Keyword::Exalted => is_exalted_trigger(trigger),
+            Keyword::Flanking => is_flanking_trigger(trigger),
             Keyword::Extort => is_extort_trigger(trigger),
             Keyword::Increment => is_increment_trigger(trigger),
             Keyword::Myriad => is_myriad_attack_trigger(trigger),
@@ -2730,12 +2739,6 @@ fn afterlife_trigger_count(t: &TriggerDefinition) -> Option<i32> {
 /// CR 702.46a: Soulshift N — "When this creature dies, you may return target
 /// Spirit card with mana value N or less from your graveyard to your hand."
 ///
-/// NOTE: CR numbers below are verified against the existing `Keyword::Soulshift`
-/// doc comment (`types/keywords.rs`) and the 702.x keyword-ability range. The
-/// repository's `docs/MagicCompRules.txt` is gitignored and absent from this
-/// fresh clone, so the exact subsection letters (702.46a / 702.46b) could not be
-/// grepped — they need manual CR verification against a local rules copy.
-///
 /// CR 702.46b: each instance of Soulshift triggers separately, so (via
 /// `install_matching`) one trigger is emitted per `Keyword::Soulshift(_)` on the
 /// face — mirroring Afterlife (CR 702.135b) and Bushido (CR 702.45b).
@@ -2941,12 +2944,26 @@ pub fn synthesize_exalted(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Exalted));
 }
 
+/// CR 702.25a: Flanking — install the becomes-blocked debuff trigger that gives
+/// each blocking creature without flanking -1/-1 until end of turn. CR 702.25b:
+/// each instance triggers separately (one trigger per `Keyword::Flanking`).
+pub fn synthesize_flanking(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Flanking));
+}
+
 /// CR 702.45a: Bushido N — "Whenever this creature blocks or becomes blocked, it
 /// gets +N/+N until end of turn." Two self-triggers (blocks + becomes-blocked),
 /// since there is no combined block trigger mode. CR 702.45b: each instance
 /// triggers separately, so one pair is synthesized per `Keyword::Bushido`.
 pub fn synthesize_bushido(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Bushido(_)));
+}
+
+/// CR 702.91a: Battle cry — "whenever this creature attacks, each other
+/// attacking creature gets +1/+0 until end of turn." CR 702.91b: each instance
+/// triggers separately, so one trigger is synthesized per `Keyword::Battlecry`.
+pub fn synthesize_battlecry(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Battlecry));
 }
 
 /// CR 702.101a: Extort — a spell-cast trigger that lets you pay {W/B} to drain
@@ -3472,6 +3489,58 @@ fn is_exalted_trigger(t: &TriggerDefinition) -> bool {
         )
 }
 
+/// CR 702.25a: Build the Flanking trigger — "whenever this creature becomes
+/// blocked by a creature without flanking, the blocking creature gets -1/-1
+/// until end of turn." `collect_matching_triggers` splits `BecomesBlocked`
+/// events per qualifying blocker so each blocker creates its own stack object.
+fn build_flanking_trigger() -> TriggerDefinition {
+    let debuff = Effect::Pump {
+        power: PtValue::Fixed(-1),
+        toughness: PtValue::Fixed(-1),
+        target: TargetFilter::TriggeringSource,
+    };
+    let execute = AbilityDefinition::new(AbilityKind::Spell, debuff)
+        .duration(Duration::UntilEndOfTurn)
+        .description(
+            "CR 702.25a: Flanking — blocking creatures without flanking get -1/-1 until end of turn"
+                .to_string(),
+        );
+    TriggerDefinition::new(TriggerMode::BecomesBlocked)
+        .valid_card(TargetFilter::SelfRef)
+        .valid_target(TargetFilter::Typed(TypedFilter::creature().properties(
+            vec![FilterProp::WithoutKeyword {
+                value: Keyword::Flanking,
+            }],
+        )))
+        .execute(execute)
+        .description(
+            "CR 702.25a: Flanking — whenever this creature becomes blocked by a creature \
+             without flanking, the blocking creature gets -1/-1 until end of turn."
+                .to_string(),
+        )
+}
+
+/// CR 702.25a: A Flanking-shaped trigger — a self-scoped `BecomesBlocked` trigger
+/// whose blocker filter excludes creatures with flanking.
+/// Used by `RemoveKeyword` symmetric removal.
+fn is_flanking_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::BecomesBlocked)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && matches!(
+            t.valid_target.as_ref(),
+            Some(TargetFilter::Typed(tf)) if tf.properties.contains(&FilterProp::WithoutKeyword {
+                value: Keyword::Flanking,
+            })
+        )
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::Pump {
+                target: TargetFilter::TriggeringSource,
+                ..
+            })
+        )
+}
+
 /// CR 702.45a: Build one Bushido self-trigger for the given block event
 /// (`Blocks` or `BecomesBlocked`): "this creature gets +N/+N until end of turn."
 /// Scoped to the source creature via `valid_card` (the field block matchers read)
@@ -3517,6 +3586,60 @@ fn is_bushido_trigger(t: &TriggerDefinition, n: u32) -> bool {
                 toughness: PtValue::Fixed(tough),
                 target: TargetFilter::SelfRef,
             }) if *p == n as i32 && *tough == n as i32
+        )
+}
+
+/// CR 702.91a: "each other attacking creature" — every attacking creature
+/// except the Battle cry source. `Another` is source-relative in this path: the
+/// `PumpAll` resolves with `FilterContext::from_ability`, whose `recipient_id`
+/// is `None`, so the object-level check reduces to `object_id != source.id` and
+/// excludes exactly the ability source. Shared by the builder and the
+/// `RemoveKeyword` matcher so both describe one canonical filter.
+fn battlecry_target_filter() -> TypedFilter {
+    let mut tf = TypedFilter::creature();
+    tf.properties = vec![FilterProp::Attacking, FilterProp::Another];
+    tf
+}
+
+/// CR 702.91a: Build the Battle cry attack trigger. The effect is a mass
+/// `Effect::PumpAll` over the other-attackers set (no target slot, no choice),
+/// mirroring the self-scoped Bushido trigger but pumping co-attackers +1/+0.
+fn build_battlecry_trigger() -> TriggerDefinition {
+    let pump = Effect::PumpAll {
+        power: PtValue::Fixed(1),
+        toughness: PtValue::Fixed(0),
+        target: TargetFilter::Typed(battlecry_target_filter()),
+    };
+    let execute = AbilityDefinition::new(AbilityKind::Spell, pump).description(
+        "CR 702.91a: Battle cry — each other attacking creature +1/+0 until end of turn"
+            .to_string(),
+    );
+    TriggerDefinition::new(TriggerMode::Attacks)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(execute)
+        .description(
+            "CR 702.91a: Battle cry — whenever this creature attacks, each other \
+             attacking creature gets +1/+0 until end of turn."
+                .to_string(),
+        )
+}
+
+/// CR 702.91a/b: A Battle cry trigger — an `Attacks` trigger scoped to the
+/// source (`valid_card: SelfRef`) whose execute is the canonical
+/// `PumpAll(+1/+0)` over `battlecry_target_filter()`. Used by `RemoveKeyword`
+/// symmetric removal so a granted-then-removed `Battlecry` strips exactly its
+/// own trigger (asserting the filter so it never matches a coincidental printed
+/// attack-pump on the same face).
+fn is_battlecry_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::Attacks)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::PumpAll {
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(0),
+                target: TargetFilter::Typed(tf),
+            }) if *tf == battlecry_target_filter()
         )
 }
 
@@ -5608,6 +5731,9 @@ pub fn synthesize_all(face: &mut CardFace) {
     // whenever a creature you control attacks alone. CR 702.83b: each instance
     // triggers separately.
     synthesize_exalted(face);
+    // CR 702.25a: Flanking — becomes-blocked trigger giving each blocking
+    // creature without flanking -1/-1 until end of turn.
+    synthesize_flanking(face);
     // CR 702.101a: Extort — spell-cast trigger that lets you pay {W/B} to drain
     // each opponent for 1 life. CR 702.101b: each instance triggers separately.
     synthesize_extort(face);
@@ -5633,6 +5759,9 @@ pub fn synthesize_all(face: &mut CardFace) {
     // CR 702.45a: Bushido N — self blocks / becomes-blocked triggers that pump
     // the creature +N/+N until end of turn.
     synthesize_bushido(face);
+    // CR 702.91a: Battle cry — attack trigger pumping each other attacking
+    // creature +1/+0 until end of turn.
+    synthesize_battlecry(face);
     // CR 702.95a: Soulbond — two optional ETB triggers that create pair
     // relationships under the resolution checks in CR 702.95c-d.
     synthesize_soulbond(face);
@@ -8206,6 +8335,8 @@ mod undying_persist_runtime_tests {
     use crate::game::printed_cards::apply_card_face_to_object;
     use crate::game::triggers::process_triggers;
     use crate::game::zones::{create_object, move_to_zone};
+    use crate::types::ability::TargetRef;
+    use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::events::GameEvent;
@@ -8226,6 +8357,43 @@ mod undying_persist_runtime_tests {
         face.card_type.core_types.push(CoreType::Creature);
         synthesize_all(&mut face);
         face
+    }
+
+    fn spirit_card_face(name: &str, mana_value: u32) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            mana_cost: ManaCost::generic(mana_value),
+            power: Some(PtValue::Fixed(1)),
+            toughness: Some(PtValue::Fixed(1)),
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        face.card_type.subtypes.push("Spirit".to_string());
+        face
+    }
+
+    fn creature_card_face(name: &str, mana_value: u32) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            mana_cost: ManaCost::generic(mana_value),
+            power: Some(PtValue::Fixed(1)),
+            toughness: Some(PtValue::Fixed(1)),
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        face
+    }
+
+    fn create_face_object(
+        state: &mut GameState,
+        face: &CardFace,
+        owner: PlayerId,
+        zone: Zone,
+    ) -> ObjectId {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(state, card_id, owner, face.name.clone(), zone);
+        apply_card_face_to_object(state.objects.get_mut(&id).unwrap(), face);
+        id
     }
 
     /// Stand up a two-player state with `face` on the battlefield under
@@ -8521,6 +8689,82 @@ mod undying_persist_runtime_tests {
                 "no eligible Spirit means no target is chosen"
             );
         }
+    }
+
+    /// CR 702.46a runtime path: accepting Soulshift N returns target Spirit card
+    /// with mana value N or less from the controller's graveyard to their hand.
+    #[test]
+    fn soulshift_returns_eligible_spirit_card_from_graveyard() {
+        let face = creature_face_with_keyword("Kami of the Honored Dead", Keyword::Soulshift(4));
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+        let legal_spirit = create_face_object(
+            &mut state,
+            &spirit_card_face("Petalmane Baku", 3),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+        let too_expensive_spirit = create_face_object(
+            &mut state,
+            &spirit_card_face("High-Cost Spirit", 5),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+        let non_spirit = create_face_object(
+            &mut state,
+            &creature_card_face("Ordinary Bear", 2),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, obj_id, Zone::Graveyard, &mut events);
+        process_triggers(&mut state, &events);
+        if matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }) {
+            crate::game::engine::apply_as_current(
+                &mut state,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(legal_spirit)),
+                },
+            )
+            .expect("choose the only legal Soulshift target");
+        }
+
+        let mut resolve_events = Vec::new();
+        crate::game::stack::resolve_top(&mut state, &mut resolve_events);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "Soulshift is optional and must ask before returning the Spirit"
+        );
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: true },
+        )
+        .expect("accept Soulshift");
+        if matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }) {
+            crate::game::engine::apply_as_current(
+                &mut state,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(legal_spirit)),
+                },
+            )
+            .expect("choose the legal Soulshift target after accepting");
+        }
+
+        assert_eq!(
+            state.objects[&legal_spirit].zone,
+            Zone::Hand,
+            "Soulshift must return the eligible Spirit card to hand"
+        );
+        assert_eq!(
+            state.objects[&too_expensive_spirit].zone,
+            Zone::Graveyard,
+            "Soulshift 4 must not return a Spirit card with mana value 5"
+        );
+        assert_eq!(
+            state.objects[&non_spirit].zone,
+            Zone::Graveyard,
+            "Soulshift must not return a non-Spirit card"
+        );
     }
 
     /// CR 603 multi-trigger semantics: a permanent that carries BOTH Undying
@@ -9072,6 +9316,69 @@ mod exalted_synthesis_tests {
 }
 
 #[cfg(test)]
+mod flanking_synthesis_tests {
+    //! CR 702.25a shape tests: a self-scoped BecomesBlocked trigger whose
+    //! `Effect::Pump(-1/-1)` debuffs the triggering blocker without flanking.
+    use super::*;
+
+    #[test]
+    fn synthesize_flanking_adds_becomes_blocked_debuff_trigger() {
+        // CR 702.25a: Flanking installs a self BecomesBlocked trigger that gives
+        // each blocking creature without flanking -1/-1 until end of turn.
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Flanking);
+        synthesize_flanking(&mut face);
+
+        let trigger = face
+            .triggers
+            .iter()
+            .find(|t| is_flanking_trigger(t))
+            .expect("flanking should add a BecomesBlocked trigger");
+        assert!(matches!(trigger.mode, TriggerMode::BecomesBlocked));
+        assert!(matches!(trigger.valid_card, Some(TargetFilter::SelfRef)));
+        let execute = trigger.execute.as_deref().expect("execute body required");
+        assert_eq!(execute.duration, Some(Duration::UntilEndOfTurn));
+        let Effect::Pump {
+            power,
+            toughness,
+            target,
+        } = &*execute.effect
+        else {
+            panic!("flanking execute must be Effect::Pump");
+        };
+        assert!(matches!(power, PtValue::Fixed(-1)));
+        assert!(matches!(toughness, PtValue::Fixed(-1)));
+        assert!(matches!(target, TargetFilter::TriggeringSource));
+        let Some(TargetFilter::Typed(tf)) = trigger.valid_target.as_ref() else {
+            panic!("expected Typed non-flanking blocker filter");
+        };
+        assert!(tf.properties.contains(&FilterProp::WithoutKeyword {
+            value: Keyword::Flanking,
+        }));
+    }
+
+    #[test]
+    fn synthesize_flanking_is_idempotent_and_noop_without_keyword() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Flanking);
+        synthesize_flanking(&mut face);
+        synthesize_flanking(&mut face);
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_flanking_trigger(t))
+                .count(),
+            1,
+            "flanking trigger should be deduped across passes"
+        );
+
+        let mut bare = CardFace::default();
+        synthesize_flanking(&mut bare);
+        assert!(bare.triggers.iter().all(|t| !is_flanking_trigger(t)));
+    }
+}
+
+#[cfg(test)]
 mod bushido_synthesis_tests {
     //! CR 702.45a shape tests: two self-scoped triggers (Blocks +
     //! BecomesBlocked), each an `Effect::Pump` on `SelfRef` of +N/+N.
@@ -9131,6 +9438,103 @@ mod bushido_synthesis_tests {
         let mut bare = CardFace::default();
         synthesize_bushido(&mut bare);
         assert!(bare.triggers.iter().all(|t| !is_bushido_trigger(t, 1)));
+    }
+}
+
+#[cfg(test)]
+mod battlecry_synthesis_tests {
+    //! CR 702.91a shape tests: one `Attacks` trigger whose execute is a mass
+    //! `Effect::PumpAll(+1/+0)` over other attacking creatures.
+    use super::*;
+
+    #[test]
+    fn synthesize_battlecry_adds_attack_pump_all_trigger() {
+        // CR 702.91a: Battle cry installs one attack trigger pumping each other
+        // attacking creature +1/+0 until end of turn.
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Battlecry);
+        synthesize_battlecry(&mut face);
+
+        let triggers: Vec<_> = face
+            .triggers
+            .iter()
+            .filter(|t| is_battlecry_trigger(t))
+            .collect();
+        assert_eq!(triggers.len(), 1);
+        let t = triggers[0];
+        assert!(matches!(t.mode, TriggerMode::Attacks));
+        assert!(matches!(t.valid_card, Some(TargetFilter::SelfRef)));
+        let Some(Effect::PumpAll {
+            power,
+            toughness,
+            target,
+        }) = t.execute.as_deref().map(|a| &*a.effect)
+        else {
+            panic!("battle cry execute must be Effect::PumpAll");
+        };
+        assert!(matches!(power, PtValue::Fixed(1)));
+        assert!(matches!(toughness, PtValue::Fixed(0)));
+        let TargetFilter::Typed(tf) = target else {
+            panic!("battle cry target must be Typed");
+        };
+        // CR 702.91a: other attacking creatures — `Attacking` + source-relative
+        // `Another`.
+        assert_eq!(
+            tf.properties,
+            vec![FilterProp::Attacking, FilterProp::Another]
+        );
+    }
+
+    #[test]
+    fn synthesize_battlecry_is_idempotent_and_noop_without_keyword() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Battlecry);
+        synthesize_battlecry(&mut face);
+        synthesize_battlecry(&mut face);
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_battlecry_trigger(t))
+                .count(),
+            1,
+            "one trigger, deduped across passes"
+        );
+
+        let mut bare = CardFace::default();
+        synthesize_battlecry(&mut bare);
+        assert!(bare.triggers.iter().all(|t| !is_battlecry_trigger(t)));
+    }
+
+    #[test]
+    fn battlecry_multiplicity_installs_one_trigger_per_instance() {
+        // CR 702.91b: each instance of battle cry triggers separately.
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Battlecry);
+        face.keywords.push(Keyword::Battlecry);
+        synthesize_battlecry(&mut face);
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|t| is_battlecry_trigger(t))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn battlecry_triggers_for_and_matcher_roundtrip() {
+        // CR 604.1 runtime-grant path: `triggers_for` produces the trigger and
+        // `trigger_matches_keyword_kind` recognizes it (RemoveKeyword symmetry).
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Battlecry);
+        assert_eq!(triggers.len(), 1);
+        assert!(KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Battlecry
+        ));
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Flanking
+        ));
     }
 }
 
