@@ -18,7 +18,7 @@ use crate::types::keywords::{Keyword, KeywordKind};
 use crate::types::phase::Phase;
 use crate::types::player::{Player, PlayerCounterKind, PlayerId};
 use crate::types::statics::{StaticMode, TriggerCause};
-use crate::types::triggers::TriggerMode;
+use crate::types::triggers::{AttackTargetFilter, TriggerMode};
 use crate::types::zones::Zone;
 
 use super::ability_utils::build_resolved_from_def;
@@ -483,6 +483,13 @@ fn collect_matching_triggers(
                     .into_iter()
                     .map(|trigger_event| vec![trigger_event])
                     .collect()
+            } else if matches!(trig_def.mode, TriggerMode::BecomesBlocked) {
+                super::trigger_matchers::matching_becomes_blocked_events(
+                    event, trig_def, obj_id, state,
+                )
+                .into_iter()
+                .map(|trigger_event| vec![trigger_event])
+                .collect()
             } else if matches!(trig_def.mode, TriggerMode::DamageDoneOnceByController) {
                 // CR 603.2c: One aggregate combat-damage event may satisfy this
                 // trigger once, while CR 608.2c makes the filtered source set
@@ -932,7 +939,13 @@ fn collect_pending_triggers(
             for matched in matched_triggers {
                 #[cfg(debug_assertions)]
                 production_matched.insert((obj_id, matched.trig_idx));
-                record_trigger_fired(state, matched.constraint.as_ref(), obj_id, matched.trig_idx);
+                record_trigger_fired(
+                    state,
+                    matched.constraint.as_ref(),
+                    obj_id,
+                    matched.trig_idx,
+                    event,
+                );
                 if matched.batched {
                     batched_this_pass.insert((obj_id, matched.trig_idx));
                 }
@@ -1319,6 +1332,7 @@ fn collect_pending_triggers(
                         matched.constraint.as_ref(),
                         *moved_id,
                         matched.trig_idx,
+                        event,
                     );
                     if matched.batched {
                         batched_this_pass.insert((*moved_id, matched.trig_idx));
@@ -1386,6 +1400,7 @@ fn collect_pending_triggers(
                         matched.constraint.as_ref(),
                         observer_id,
                         matched.trig_idx,
+                        event,
                     );
                     if matched.batched {
                         batched_this_pass.insert((observer_id, matched.trig_idx));
@@ -1430,6 +1445,7 @@ fn collect_pending_triggers(
                         matched.constraint.as_ref(),
                         obj_id,
                         matched.trig_idx,
+                        event,
                     );
                     if matched.batched {
                         batched_this_pass.insert((obj_id, matched.trig_idx));
@@ -3148,7 +3164,7 @@ fn dispatch_pending_trigger_context(
 /// `deferred_triggers`. Mid-resolution `Priority` from player-scope iteration,
 /// `repeat_for`, or replacement continuations must not drain (or offer CR
 /// 603.3b ordering) until those continuations finish.
-pub(crate) fn should_drain_deferred_triggers_now(state: &GameState) -> bool {
+fn can_drain_deferred_triggers(state: &GameState, allow_spell_on_stack: bool) -> bool {
     if state.deferred_triggers.is_empty() {
         return false;
     }
@@ -3170,14 +3186,19 @@ pub(crate) fn should_drain_deferred_triggers_now(state: &GameState) -> bool {
     // CR 603.3b + issue #1793: observer triggers parked during a spell's
     // resolution must wait until that spell leaves the stack — draining while
     // a `Spell` entry remains would offer ordering mid player_scope iteration.
-    if state
-        .stack
-        .iter()
-        .any(|entry| matches!(entry.kind, StackEntryKind::Spell { .. }))
+    if !allow_spell_on_stack
+        && state
+            .stack
+            .iter()
+            .any(|entry| matches!(entry.kind, StackEntryKind::Spell { .. }))
     {
         return false;
     }
     true
+}
+
+pub(crate) fn should_drain_deferred_triggers_now(state: &GameState) -> bool {
+    can_drain_deferred_triggers(state, false)
 }
 
 /// CR 113.2c + CR 603.2 + CR 603.3b: Drain the deferred-trigger queue after
@@ -3200,6 +3221,30 @@ pub(crate) fn drain_deferred_trigger_queue(
         return None;
     }
 
+    drain_deferred_trigger_queue_unchecked(state, events_out)
+}
+
+/// CR 601.2h + CR 602.2b + CR 603.3: Cost-payment triggers collected while a
+/// spell or ability announcement was paused go on the stack at the first
+/// priority point after that stack object is fully announced, even though that
+/// spell or ability itself is still on the stack. Resolution-time callers must
+/// keep using `drain_deferred_trigger_queue`, whose spell-on-stack guard
+/// prevents mid-resolution drains.
+pub(crate) fn drain_deferred_triggers_after_stack_object_announcement(
+    state: &mut GameState,
+    events_out: &mut Vec<GameEvent>,
+) -> Option<crate::types::game_state::WaitingFor> {
+    if !can_drain_deferred_triggers(state, true) {
+        return None;
+    }
+
+    drain_deferred_trigger_queue_unchecked(state, events_out)
+}
+
+fn drain_deferred_trigger_queue_unchecked(
+    state: &mut GameState,
+    events_out: &mut Vec<GameEvent>,
+) -> Option<crate::types::game_state::WaitingFor> {
     let pending = std::mem::take(&mut state.deferred_triggers);
     match begin_trigger_ordering(state, pending) {
         TriggerOrderingDisposition::PromptForChoice(wf) => {
@@ -3694,6 +3739,21 @@ fn check_trigger_constraint(
         TriggerConstraint::OncePerGame => !state.triggers_fired_this_game.contains(&key),
         TriggerConstraint::OnlyDuringYourTurn => state.active_player == controller,
         TriggerConstraint::OnlyDuringOpponentsTurn => state.active_player != controller,
+        TriggerConstraint::OncePerOpponentPerTurn => {
+            // CR 603.2: The trigger event only matches the first life-loss event
+            // during that opponent's own turn.
+            let opponent_id = match event {
+                GameEvent::LifeChanged { player_id, .. } => *player_id,
+                _ => return false,
+            };
+            if opponent_id == controller || state.active_player != opponent_id {
+                return false;
+            }
+            let per_opponent_key = (obj_id, trig_idx, opponent_id);
+            !state
+                .triggers_fired_this_turn_per_opponent
+                .contains(&per_opponent_key)
+        }
         // CR 505.1: Main phases are precombat and postcombat.
         TriggerConstraint::OnlyDuringYourMainPhase => {
             state.active_player == controller
@@ -3809,61 +3869,32 @@ pub(crate) fn check_trigger_condition(
                 co_attacker_count >= *minimum as usize
             })
         }
-        // CR 508.1 + CR 603.2c: Count attackers in the triggering AttackersDeclared
-        // batch whose controller matches `scope` relative to the trigger controller.
-        TriggerCondition::AttackersDeclaredMin {
-            scope,
-            minimum,
-            filter,
+        // CR 506.2 + CR 508.1 + CR 508.1b + CR 603.4: Compare a count over the
+        // current attack declaration, either by attacker controller (optionally
+        // narrowed to a typed class, e.g. "two or more Dinosaurs") or by the
+        // announced attack target.
+        TriggerCondition::AttackersDeclaredCount {
+            subject,
+            comparator,
+            count,
         } => {
-            let Some(GameEvent::AttackersDeclared { attacker_ids, .. }) = trigger_event else {
+            let Some(GameEvent::AttackersDeclared {
+                attacker_ids,
+                attacks,
+                ..
+            }) = trigger_event
+            else {
                 return false;
             };
-            let count = attacker_ids
-                .iter()
-                .filter(|id| {
-                    let scope_ok = state.objects.get(id).is_some_and(|obj| match scope {
-                        ControllerRef::You => obj.controller == controller,
-                        ControllerRef::Opponent => obj.controller != controller,
-                        // Other ControllerRef variants are not used by the attacks-with-N
-                        // combinator; treat as permissive to avoid silently dropping matches.
-                        _ => true,
-                    });
-                    // CR 508.1: only attackers matching the filtered class count
-                    // toward the typed minimum, preventing "attack with two or more
-                    // Dinosaurs" from over-firing on mixed attacker batches.
-                    scope_ok
-                        && filter.as_ref().is_none_or(|f| {
-                            crate::game::trigger_matchers::target_filter_matches_object(
-                                state,
-                                **id,
-                                f,
-                                source_id.unwrap_or(ObjectId(0)),
-                            )
-                        })
-                })
-                .count();
-            count >= *minimum as usize
-        }
-        // CR 506.2 + CR 508.1b + CR 603.4: "if none of those creatures attacked you" —
-        // Iterate the attack batch's per-attacker targets; fail the condition if any
-        // attacker controlled by a player other than the trigger controller targeted
-        // the trigger controller directly (CR 506.2: the defending player).
-        TriggerCondition::NoneOfAttackersTargetedYou => {
-            let Some(GameEvent::AttackersDeclared { attacks, .. }) = trigger_event else {
-                return false;
-            };
-            !attacks.iter().any(|(attacker_id, target)| {
-                let attacker_is_other = state
-                    .objects
-                    .get(attacker_id)
-                    .is_some_and(|obj| obj.controller != controller);
-                attacker_is_other
-                    && matches!(
-                        target,
-                        crate::game::combat::AttackTarget::Player(p) if *p == controller
-                    )
-            })
+            let actual = attackers_declared_count(
+                state,
+                attacker_ids,
+                attacks,
+                controller,
+                source_id,
+                subject,
+            );
+            comparator.evaluate(actual as i32, *count as i32)
         }
         // CR 719.2: True when the source Case is unsolved and its solve condition is met.
         TriggerCondition::SolveConditionMet => source_id
@@ -4431,6 +4462,106 @@ pub(crate) fn check_trigger_condition(
     }
 }
 
+fn attackers_declared_count(
+    state: &GameState,
+    attacker_ids: &[ObjectId],
+    attacks: &[(ObjectId, crate::game::combat::AttackTarget)],
+    trigger_controller: PlayerId,
+    source_id: Option<ObjectId>,
+    subject: &crate::types::ability::AttackersDeclaredCountSubject,
+) -> usize {
+    match subject {
+        crate::types::ability::AttackersDeclaredCountSubject::Controller { scope, filter } => {
+            attacker_ids
+                .iter()
+                .filter(|id| {
+                    let scope_ok = state.objects.get(id).is_some_and(|obj| {
+                        controller_ref_matches_player(obj.controller, trigger_controller, scope)
+                    });
+                    // CR 508.1: only attackers matching the filtered class count
+                    // toward the typed minimum, preventing "attack with two or
+                    // more Dinosaurs" from over-firing on mixed attacker batches.
+                    scope_ok
+                        && filter.as_ref().is_none_or(|f| {
+                            crate::game::trigger_matchers::target_filter_matches_object(
+                                state,
+                                **id,
+                                f,
+                                source_id.unwrap_or(ObjectId(0)),
+                            )
+                        })
+                })
+                .count()
+        }
+        crate::types::ability::AttackersDeclaredCountSubject::AttackTarget {
+            controller,
+            attacked,
+        } => attacks
+            .iter()
+            .filter(|(_, target)| {
+                attack_target_matches_controller_scope(
+                    state,
+                    *target,
+                    trigger_controller,
+                    controller,
+                    attacked,
+                )
+            })
+            .count(),
+    }
+}
+
+fn controller_ref_matches_player(
+    player_id: PlayerId,
+    trigger_controller: PlayerId,
+    controller_ref: &ControllerRef,
+) -> bool {
+    match controller_ref {
+        ControllerRef::You => player_id == trigger_controller,
+        ControllerRef::Opponent => player_id != trigger_controller,
+        // Other ControllerRef variants are not meaningful for attack-declaration
+        // counts until a parser emits an event-bound player target.
+        _ => false,
+    }
+}
+
+fn attack_target_matches_controller_scope(
+    state: &GameState,
+    target: crate::game::combat::AttackTarget,
+    trigger_controller: PlayerId,
+    controller_ref: &ControllerRef,
+    attacked: &AttackTargetFilter,
+) -> bool {
+    let player_matches = |player_id: PlayerId| {
+        controller_ref_matches_player(player_id, trigger_controller, controller_ref)
+    };
+
+    match (attacked, target) {
+        (AttackTargetFilter::Player, crate::game::combat::AttackTarget::Player(player_id))
+        | (
+            AttackTargetFilter::PlayerOrPlaneswalker,
+            crate::game::combat::AttackTarget::Player(player_id),
+        ) => player_matches(player_id),
+        (
+            AttackTargetFilter::Planeswalker,
+            crate::game::combat::AttackTarget::Planeswalker(object_id),
+        )
+        | (
+            AttackTargetFilter::PlayerOrPlaneswalker,
+            crate::game::combat::AttackTarget::Planeswalker(object_id),
+        ) => state
+            .objects
+            .get(&object_id)
+            .is_some_and(|object| player_matches(object.controller)),
+        (AttackTargetFilter::Battle, crate::game::combat::AttackTarget::Battle(object_id)) => state
+            .objects
+            .get(&object_id)
+            .and_then(|object| object.protector())
+            .is_some_and(player_matches),
+        _ => false,
+    }
+}
+
 /// CR 719.2: Evaluate a Case's solve condition against the current game state.
 /// Returns true when the Case is unsolved and its condition is currently met.
 fn evaluate_solve_condition(
@@ -4483,6 +4614,7 @@ fn record_trigger_fired(
     constraint: Option<&crate::types::ability::TriggerConstraint>,
     obj_id: ObjectId,
     trig_idx: usize,
+    event: &GameEvent,
 ) {
     use crate::types::ability::TriggerConstraint;
 
@@ -4499,6 +4631,25 @@ fn record_trigger_fired(
         }
         TriggerConstraint::OncePerGame => {
             state.triggers_fired_this_game.insert(key);
+        }
+        TriggerConstraint::OncePerOpponentPerTurn => {
+            // CR 603.2: The trigger event only matches the first life-loss event
+            // during that opponent's own turn.
+            let opponent_id = match event {
+                GameEvent::LifeChanged { player_id, .. } => *player_id,
+                _ => return,
+            };
+            let Some(controller) = state.objects.get(&obj_id).map(|object| object.controller)
+            else {
+                return;
+            };
+            if opponent_id == controller || state.active_player != opponent_id {
+                return;
+            }
+            let per_opponent_key = (obj_id, trig_idx, opponent_id);
+            state
+                .triggers_fired_this_turn_per_opponent
+                .insert(per_opponent_key);
         }
         TriggerConstraint::OnlyDuringYourTurn
         | TriggerConstraint::OnlyDuringOpponentsTurn
@@ -4716,12 +4867,13 @@ pub mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost,
-        AggregateFunction, ChosenAttribute, ChosenSubtypeKind, CommanderOwnership, Comparator,
-        ContinuousModification, ControllerRef, DelayedTriggerCondition, Duration, Effect,
-        FilterProp, KickerVariant, MultiTargetSpec, PaymentCost, PlayerFilter, PlayerScope, PtStat,
-        PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility, SearchSelectionConstraint,
-        SharedQuality, SharedQualityRelation, StaticCondition, StaticDefinition, TargetFilter,
-        TargetRef, TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
+        AggregateFunction, AttackersDeclaredCountSubject, ChosenAttribute, ChosenSubtypeKind,
+        CommanderOwnership, Comparator, ContinuousModification, ControllerRef,
+        DelayedTriggerCondition, Duration, Effect, FilterProp, KickerVariant, MultiTargetSpec,
+        PaymentCost, PlayerFilter, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+        ResolvedAbility, SearchSelectionConstraint, SharedQuality, SharedQualityRelation,
+        StaticCondition, StaticDefinition, TargetFilter, TargetRef, TriggerCondition,
+        TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -4789,6 +4941,103 @@ pub mod tests {
         obj.power = Some(power);
         obj.toughness = Some(toughness);
         id
+    }
+
+    #[test]
+    fn becomes_blocked_trigger_collects_once_per_non_flanking_blocker() {
+        let mut state = setup();
+        let attacker = make_creature(&mut state, PlayerId(0), "Knight of Valor", 2, 2);
+        let first_blocker = make_creature(&mut state, PlayerId(1), "First Blocker", 2, 2);
+        let second_blocker = make_creature(&mut state, PlayerId(1), "Second Blocker", 2, 2);
+        let flanking_blocker = make_creature(&mut state, PlayerId(1), "Flanking Blocker", 2, 2);
+        state
+            .objects
+            .get_mut(&flanking_blocker)
+            .unwrap()
+            .keywords
+            .push(Keyword::Flanking);
+        let trigger = TriggerDefinition::new(TriggerMode::BecomesBlocked)
+            .valid_card(TargetFilter::SelfRef)
+            .valid_target(TargetFilter::Typed(TypedFilter::creature().properties(
+                vec![FilterProp::WithoutKeyword {
+                    value: Keyword::Flanking,
+                }],
+            )))
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Pump {
+                    power: crate::types::ability::PtValue::Fixed(-1),
+                    toughness: crate::types::ability::PtValue::Fixed(-1),
+                    target: TargetFilter::TriggeringSource,
+                },
+            ));
+        let obj = state.objects.get_mut(&attacker).unwrap();
+        obj.trigger_definitions.push(trigger.clone());
+        std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).push(trigger);
+        let events = vec![GameEvent::BlockersDeclared {
+            assignments: vec![
+                (first_blocker, attacker),
+                (second_blocker, attacker),
+                (flanking_blocker, attacker),
+            ],
+        }];
+
+        let pending = collect_pending_triggers(&mut state, &events);
+        let trigger_events: Vec<_> = pending
+            .iter()
+            .filter(|ctx| ctx.pending.source_id == attacker)
+            .filter_map(|ctx| ctx.pending.trigger_event.as_ref())
+            .collect();
+
+        assert_eq!(trigger_events.len(), 2);
+        assert_eq!(
+            trigger_events,
+            vec![
+                &GameEvent::BlockersDeclared {
+                    assignments: vec![(first_blocker, attacker)]
+                },
+                &GameEvent::BlockersDeclared {
+                    assignments: vec![(second_blocker, attacker)]
+                },
+            ]
+        );
+
+        let mut stack_events = Vec::new();
+        for ctx in pending
+            .into_iter()
+            .filter(|ctx| ctx.pending.source_id == attacker)
+        {
+            push_pending_trigger_to_stack_with_event_batch(
+                &mut state,
+                ctx.pending,
+                ctx.trigger_events,
+                &mut stack_events,
+            );
+        }
+        let stack_trigger_events: Vec<_> = state
+            .stack
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                StackEntryKind::TriggeredAbility {
+                    source_id,
+                    trigger_event,
+                    ..
+                } if *source_id == attacker => trigger_event.as_ref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stack_trigger_events,
+            vec![
+                &GameEvent::BlockersDeclared {
+                    assignments: vec![(first_blocker, attacker)]
+                },
+                &GameEvent::BlockersDeclared {
+                    assignments: vec![(second_blocker, attacker)]
+                },
+            ],
+            "CR 702.25a creates one stack trigger per qualifying blocker"
+        );
     }
 
     /// Places a battlefield commander object with the given owner/controller.
@@ -11134,6 +11383,70 @@ pub mod tests {
     }
 
     #[test]
+    fn once_per_opponent_per_turn_requires_that_opponents_turn() {
+        let mut state = setup();
+        let trigger_index = 0;
+        let controller = PlayerId(0);
+        let opponent = PlayerId(1);
+        let source = make_creature(&mut state, controller, "Valgavoth", 4, 4);
+        let mut trig_def = make_trigger(TriggerMode::LifeLost);
+        trig_def.constraint = Some(TriggerConstraint::OncePerOpponentPerTurn);
+
+        let opponent_life_loss = GameEvent::LifeChanged {
+            player_id: opponent,
+            amount: -3,
+        };
+        state.active_player = controller;
+        assert!(!check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &opponent_life_loss,
+        ));
+
+        state.active_player = opponent;
+        assert!(check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &opponent_life_loss,
+        ));
+        record_trigger_fired(
+            &mut state,
+            trig_def.constraint.as_ref(),
+            source,
+            trigger_index,
+            &opponent_life_loss,
+        );
+        assert!(!check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &opponent_life_loss,
+        ));
+
+        let controller_life_loss = GameEvent::LifeChanged {
+            player_id: controller,
+            amount: -3,
+        };
+        state.active_player = controller;
+        assert!(!check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &controller_life_loss,
+        ));
+    }
+
+    #[test]
     fn parsed_each_of_your_main_phases_fires_only_on_controller_main_phases() {
         fn run(active_player: PlayerId, phase: Phase) -> usize {
             let mut state = setup();
@@ -12043,7 +12356,8 @@ pub mod tests {
         assert_eq!(state.stack.len(), 0);
     }
 
-    // CR 508.1 + CR 603.2c: Unit tests for the `AttackersDeclaredMin` condition
+    // CR 508.1 + CR 603.2c: Unit tests for controller-scoped
+    // `AttackersDeclaredCount` conditions.
     // (Firemane Commando's attack-batch-size gate).
     #[test]
     fn attackers_declared_min_counts_scope_you() {
@@ -12071,10 +12385,13 @@ pub mod tests {
                 (a2, crate::game::combat::AttackTarget::Player(PlayerId(1))),
             ],
         };
-        let cond = TriggerCondition::AttackersDeclaredMin {
-            scope: ControllerRef::You,
-            minimum: 2,
-            filter: None,
+        let cond = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::Controller {
+                scope: ControllerRef::You,
+                filter: None,
+            },
+            comparator: Comparator::GE,
+            count: 2,
         };
         assert!(check_trigger_condition(
             &state,
@@ -12085,10 +12402,13 @@ pub mod tests {
         ));
 
         // Raising the threshold to 3 → condition fails.
-        let cond3 = TriggerCondition::AttackersDeclaredMin {
-            scope: ControllerRef::You,
-            minimum: 3,
-            filter: None,
+        let cond3 = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::Controller {
+                scope: ControllerRef::You,
+                filter: None,
+            },
+            comparator: Comparator::GE,
+            count: 3,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -12126,10 +12446,13 @@ pub mod tests {
                 (a2, crate::game::combat::AttackTarget::Player(PlayerId(1))),
             ],
         };
-        let cond = TriggerCondition::AttackersDeclaredMin {
-            scope: ControllerRef::Opponent,
-            minimum: 2,
-            filter: None,
+        let cond = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::Controller {
+                scope: ControllerRef::Opponent,
+                filter: None,
+            },
+            comparator: Comparator::GE,
+            count: 2,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -12141,9 +12464,10 @@ pub mod tests {
     }
 
     // CR 508.1 + CR 603.2c: Over-fire guard for the condition-level type axis on
-    // `AttackersDeclaredMin` ("you attack with two or more Dinosaurs"). The
-    // count must include ONLY attackers matching `filter` — so 1 Dinosaur + 1
-    // non-Dinosaur attacker must NOT satisfy `minimum: 2`, but 2 Dinosaurs must.
+    // the `Controller` subject of `AttackersDeclaredCount` ("you attack with two
+    // or more Dinosaurs"). The count must include ONLY attackers matching
+    // `filter` — so 1 Dinosaur + 1 non-Dinosaur attacker must NOT satisfy
+    // `count: 2`, but 2 Dinosaurs must.
     #[test]
     fn attackers_declared_min_typed_filter_no_over_fire() {
         let mut state = setup();
@@ -12177,10 +12501,13 @@ pub mod tests {
 
         let dino_filter =
             TargetFilter::Typed(TypedFilter::creature().subtype("Dinosaur".to_string()));
-        let cond = TriggerCondition::AttackersDeclaredMin {
-            scope: ControllerRef::You,
-            minimum: 2,
-            filter: Some(dino_filter),
+        let cond = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::Controller {
+                scope: ControllerRef::You,
+                filter: Some(dino_filter),
+            },
+            comparator: Comparator::GE,
+            count: 2,
         };
 
         // 1 Dinosaur attacking → only 1 matching attacker → must NOT fire.
@@ -12238,7 +12565,8 @@ pub mod tests {
         );
     }
 
-    // CR 506.2 + CR 508.1b: Unit tests for `NoneOfAttackersTargetedYou`.
+    // CR 506.2 + CR 508.1b: Unit tests for target-scoped
+    // `AttackersDeclaredCount` conditions.
     #[test]
     fn none_of_attackers_targeted_you_true_when_all_attack_elsewhere() {
         let mut state = setup();
@@ -12275,7 +12603,14 @@ pub mod tests {
                 (a2, crate::game::combat::AttackTarget::Planeswalker(pw)),
             ],
         };
-        let cond = TriggerCondition::NoneOfAttackersTargetedYou;
+        let cond = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::AttackTarget {
+                controller: ControllerRef::You,
+                attacked: AttackTargetFilter::Player,
+            },
+            comparator: Comparator::EQ,
+            count: 0,
+        };
         assert!(check_trigger_condition(
             &state,
             &cond,
@@ -12321,7 +12656,126 @@ pub mod tests {
                 ),
             ],
         };
-        let cond = TriggerCondition::NoneOfAttackersTargetedYou;
+        let cond = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::AttackTarget {
+                controller: ControllerRef::You,
+                attacked: AttackTargetFilter::Player,
+            },
+            comparator: Comparator::EQ,
+            count: 0,
+        };
+        assert!(!check_trigger_condition(
+            &state,
+            &cond,
+            trigger_controller,
+            None,
+            Some(&event),
+        ));
+    }
+
+    #[test]
+    fn attackers_declared_to_controller_min_counts_player_and_planeswalker_targets() {
+        let mut state = setup();
+        let trigger_controller = PlayerId(0);
+        let a1 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "A1".to_string(),
+            Zone::Battlefield,
+        );
+        let a2 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "A2".to_string(),
+            Zone::Battlefield,
+        );
+        let planeswalker = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Walker".to_string(),
+            Zone::Battlefield,
+        );
+        let event = GameEvent::AttackersDeclared {
+            attacker_ids: vec![a1, a2],
+            defending_player: trigger_controller,
+            attacks: vec![
+                (
+                    a1,
+                    crate::game::combat::AttackTarget::Player(trigger_controller),
+                ),
+                (
+                    a2,
+                    crate::game::combat::AttackTarget::Planeswalker(planeswalker),
+                ),
+            ],
+        };
+        let cond = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::AttackTarget {
+                controller: ControllerRef::You,
+                attacked: AttackTargetFilter::PlayerOrPlaneswalker,
+            },
+            comparator: Comparator::GE,
+            count: 2,
+        };
+        assert!(check_trigger_condition(
+            &state,
+            &cond,
+            trigger_controller,
+            None,
+            Some(&event),
+        ));
+    }
+
+    #[test]
+    fn attackers_declared_to_controller_min_rejects_single_matching_target() {
+        let mut state = setup();
+        let trigger_controller = PlayerId(0);
+        let a1 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "A1".to_string(),
+            Zone::Battlefield,
+        );
+        let a2 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "A2".to_string(),
+            Zone::Battlefield,
+        );
+        let other_planeswalker = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Other Walker".to_string(),
+            Zone::Battlefield,
+        );
+        let event = GameEvent::AttackersDeclared {
+            attacker_ids: vec![a1, a2],
+            defending_player: trigger_controller,
+            attacks: vec![
+                (
+                    a1,
+                    crate::game::combat::AttackTarget::Player(trigger_controller),
+                ),
+                (
+                    a2,
+                    crate::game::combat::AttackTarget::Planeswalker(other_planeswalker),
+                ),
+            ],
+        };
+        let cond = TriggerCondition::AttackersDeclaredCount {
+            subject: AttackersDeclaredCountSubject::AttackTarget {
+                controller: ControllerRef::You,
+                attacked: AttackTargetFilter::PlayerOrPlaneswalker,
+            },
+            comparator: Comparator::GE,
+            count: 2,
+        };
         assert!(!check_trigger_condition(
             &state,
             &cond,
@@ -16994,6 +17448,96 @@ pub mod tests {
             !state.stack.is_empty() || state.pending_trigger.is_some(),
             "Jackdaw Savior trigger must fire via SelfRef when Jackdaw Savior itself dies \
              and a lower-CMC creature card exists in the graveyard (issue #887)"
+        );
+    }
+
+    /// CR 603.4 + CR 508.1 (issue #1487, Fire Lord Azula + Sunscorch Regent):
+    /// "Whenever you cast a spell while ~ is attacking, copy that spell." The
+    /// `while ~ is attacking` gate restricts the trigger to combat. Drives the
+    /// real `process_triggers` path with Azula's parsed trigger and a
+    /// `SpellCast` event, asserting the copy trigger lands on the stack ONLY
+    /// while Azula is an attacker. Before the fix the gate was dropped, so the
+    /// trigger fired on every spell cast — regardless of combat state.
+    #[test]
+    fn cast_while_attacking_trigger_gated_on_combat_state() {
+        use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
+
+        fn build_azula_state(attacking: bool) -> (GameState, ObjectId) {
+            let mut state = setup();
+            state.active_player = PlayerId(0);
+            state.priority_player = PlayerId(0);
+
+            // Azula on the battlefield, controlled by P0, with her real trigger.
+            let azula = make_creature(&mut state, PlayerId(0), "Fire Lord Azula", 4, 4);
+            let trigger = crate::parser::oracle_trigger::parse_trigger_line(
+                "Whenever you cast a spell while Fire Lord Azula is attacking, copy that spell. \
+                 You may choose new targets for the copy.",
+                "Fire Lord Azula",
+            );
+            assert_eq!(
+                trigger.condition,
+                Some(TriggerCondition::SourceIsAttacking),
+                "precondition: the parsed trigger must carry the SourceIsAttacking gate"
+            );
+            state
+                .objects
+                .get_mut(&azula)
+                .unwrap()
+                .trigger_definitions
+                .push(trigger);
+
+            // CR 508.1: enter combat with Azula declared as an attacker only in
+            // the attacking case.
+            if attacking {
+                state.combat = Some(CombatState {
+                    attackers: vec![AttackerInfo::new(
+                        azula,
+                        AttackTarget::Player(PlayerId(1)),
+                        PlayerId(1),
+                    )],
+                    ..CombatState::default()
+                });
+            }
+            (state, azula)
+        }
+
+        // CR 601.2a: P0 casts a spell — the SpellCast event the trigger watches.
+        let cast_event = |controller: PlayerId| GameEvent::SpellCast {
+            card_id: CardId(999),
+            object_id: ObjectId(999),
+            controller,
+        };
+
+        // Attacking: the copy trigger lands on the stack.
+        let (mut attacking_state, azula) = build_azula_state(true);
+        process_triggers(&mut attacking_state, &[cast_event(PlayerId(0))]);
+        let attacking_triggers = attacking_state
+            .stack
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind,
+                StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == azula)
+            })
+            .count();
+        assert_eq!(
+            attacking_triggers, 1,
+            "Azula's copy trigger must fire while she is attacking"
+        );
+
+        // Not attacking: the copy trigger must NOT fire.
+        let (mut idle_state, azula_idle) = build_azula_state(false);
+        process_triggers(&mut idle_state, &[cast_event(PlayerId(0))]);
+        let idle_triggers = idle_state
+            .stack
+            .iter()
+            .filter(|e| {
+                matches!(&e.kind,
+                StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == azula_idle)
+            })
+            .count();
+        assert_eq!(
+            idle_triggers, 0,
+            "Azula's copy trigger must NOT fire when she is not attacking (CR 603.4)"
         );
     }
 }
