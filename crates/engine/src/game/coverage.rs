@@ -4428,6 +4428,9 @@ fn count_effective_oracle_lines(oracle_text: &str) -> usize {
         if is_commander_permission_sentence(&lower) {
             continue;
         }
+        if is_deck_construction_copy_limit_sentence(stripped) {
+            continue;
+        }
 
         // Check if this line contains a modal header ("choose one —", "choose two.", etc.)
         // Handles standalone headers, triggered modals ("when enters, choose one —"),
@@ -10108,11 +10111,25 @@ mod tests {
             "A deck can have any number of cards named Relentless Rats.",
             "A deck can have up to seven cards named Seven Dwarves.",
             "A deck can have up to nine cards named Nazgûl.",
+            "Megalegendary",
+            "Megalegendary (Your deck can have any number of cards named Vazal, the Compleat.)",
         ] {
             face.oracle_text = Some(oracle.to_string());
             assert!(
                 audit_card_lines(oracle, &face).is_empty(),
                 "deck-construction line falsely flagged as a finding: {oracle}"
+            );
+
+            let mut missing = Vec::new();
+            check_silent_drops(&Some(oracle.to_string()), &[], &mut missing);
+            assert!(
+                missing.is_empty(),
+                "deck-construction line falsely counted as SilentDrop: {oracle} -> {missing:?}"
+            );
+            assert_eq!(
+                count_effective_oracle_lines(oracle),
+                0,
+                "deck-construction line should not count as a runtime oracle line: {oracle}"
             );
         }
     }
